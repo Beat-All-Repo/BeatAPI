@@ -23,7 +23,7 @@
     "removeComments": true,
     "forceConsistentCasingInFileNames": true,
     "strictFunctionTypes": true,
-    "lib": ["ES2023"]
+    "lib": ["ES2023", "DOM"]
   },
   "include": ["./src", "./api"],
   "exclude": ["node_modules"]
