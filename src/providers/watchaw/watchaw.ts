@@ -107,12 +107,14 @@ async function getEpisodeSourcesDirect(episodeIdentifier: string): Promise<any> 
   const html = await res.text();
 
   const sources: any[] = [];
+  let subtitlePayload: any = sources;
   const player1Match = html.match(/iframe[^>]+data-src="([^"]*\/api\/player1\.php\?data=([^"]+))"/i);
 
   if (player1Match) {
     try {
       const decoded = atob(player1Match[2]);
       const servers = JSON.parse(decoded);
+      subtitlePayload = servers;
       const langCounts: Record<string, number> = {};
 
       for (const server of servers) {
@@ -160,7 +162,7 @@ async function getEpisodeSourcesDirect(episodeIdentifier: string): Promise<any> 
   return {
     headers: { Referer: parsed.fullUrl, "User-Agent": UA_WAW },
     sources,
-    subtitles: collectSubtitleTracks(json?.subtitles || json?.data?.subtitles || json?.tracks || json?.data?.tracks || sources),
+    subtitles: collectSubtitleTracks((subtitlePayload as any)?.subtitles || (subtitlePayload as any)?.data?.subtitles || (subtitlePayload as any)?.tracks || (subtitlePayload as any)?.data?.tracks || sources),
   };
 }
 

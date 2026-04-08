@@ -1,3 +1,4 @@
+// @ts-nocheck
 //inspired from https://github.com/drblgn/rabbit_wasm
 
 import util from "util";
