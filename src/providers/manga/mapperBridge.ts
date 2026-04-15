@@ -1,4 +1,8 @@
 import { fetchLocalMapperChapters, fetchLocalMapperPages } from "./localMapper.js";
+import { createHash } from "node:crypto";
+import os from "node:os";
+import path from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 
 export const MANGA_MAPPER_PROVIDERS = [
   "mangadex",
@@ -55,8 +59,77 @@ const resolveDefaultMapperBaseUrl = () => {
 
 const MANGA_MAPPER_DEFAULT_BASE_URL = resolveDefaultMapperBaseUrl();
 const MANGA_MAPPER_DEFAULT_TIMEOUT_MS = 8000;
+const MANGA_MAPPER_CACHE_DIR = String(process.env.MANGA_MAPPER_CACHE_DIR || "").trim() ||
+  path.join(os.tmpdir(), "tatakaiapi", "manga-mapper-cache");
+const MANGA_MAPPER_CACHE_TTL_MS = Number.parseInt(String(process.env.MANGA_MAPPER_CACHE_TTL_MS || 1000 * 60 * 60 * 6), 10);
+const MANGA_MAPPER_CACHE_STALE_MS = Number.parseInt(String(process.env.MANGA_MAPPER_CACHE_STALE_MS || 1000 * 60 * 60 * 24 * 3), 10);
 
 const now = () => Date.now();
+const memoryMapperCache = new Map<string, PersistedMapperCacheEntry>();
+
+type PersistedMapperCacheEntry = {
+  version: 1;
+  key: string;
+  path: string;
+  payload: unknown;
+  status: number;
+  savedAt: number;
+  expiresAt: number;
+  staleUntil: number;
+};
+
+const asPositive = (value: number, fallback: number) => {
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return value;
+};
+
+const MAPPER_CACHE_TTL_MS = asPositive(MANGA_MAPPER_CACHE_TTL_MS, 1000 * 60 * 60 * 6);
+const MAPPER_CACHE_STALE_MS = Math.max(MAPPER_CACHE_TTL_MS, asPositive(MANGA_MAPPER_CACHE_STALE_MS, 1000 * 60 * 60 * 24 * 3));
+
+const toCacheFilePath = (requestPath: string) => {
+  const digest = createHash("sha1").update(requestPath).digest("hex");
+  return path.join(MANGA_MAPPER_CACHE_DIR, `${digest}.json`);
+};
+
+const readPersistedMapperCache = async (requestPath: string): Promise<PersistedMapperCacheEntry | null> => {
+  const inMemory = memoryMapperCache.get(requestPath);
+  if (inMemory) return inMemory;
+
+  try {
+    const cachePath = toCacheFilePath(requestPath);
+    const raw = await readFile(cachePath, "utf-8");
+    const parsed = JSON.parse(raw) as PersistedMapperCacheEntry;
+    if (!parsed || parsed.version !== 1 || parsed.path !== requestPath) return null;
+    memoryMapperCache.set(requestPath, parsed);
+    return parsed;
+  } catch {
+    return null;
+  }
+};
+
+const persistMapperCache = async (requestPath: string, status: number, payload: unknown) => {
+  const savedAt = now();
+  const entry: PersistedMapperCacheEntry = {
+    version: 1,
+    key: createHash("sha1").update(requestPath).digest("hex"),
+    path: requestPath,
+    payload,
+    status,
+    savedAt,
+    expiresAt: savedAt + MAPPER_CACHE_TTL_MS,
+    staleUntil: savedAt + MAPPER_CACHE_STALE_MS,
+  };
+
+  memoryMapperCache.set(requestPath, entry);
+
+  try {
+    await mkdir(MANGA_MAPPER_CACHE_DIR, { recursive: true });
+    const cachePath = toCacheFilePath(requestPath);
+    await writeFile(cachePath, JSON.stringify(entry), "utf-8");
+  } catch {
+    // Best-effort disk persistence; mapper flow should continue even when writes fail.
+  }
+};
 
 const readBaseUrl = () => {
   return String(process.env.MANGA_MAPPER_BASE_URL || MANGA_MAPPER_DEFAULT_BASE_URL).replace(/\/+$/, "");
@@ -131,6 +204,18 @@ const fetchMapperPath = async (path: string) => {
   const start = now();
   const baseUrl = readBaseUrl();
   const timeoutMs = readTimeoutMs();
+  const cached = await readPersistedMapperCache(path);
+
+  if (cached && now() <= cached.expiresAt) {
+    return {
+      ok: cached.status >= 200 && cached.status < 300,
+      status: cached.status,
+      latencyMs: 0,
+      payload: cached.payload,
+      error: undefined,
+      source: "cache",
+    };
+  }
 
   try {
     const response = await fetch(`${baseUrl}${path}`, {
@@ -141,6 +226,10 @@ const fetchMapperPath = async (path: string) => {
     });
 
     const payload = await parseJsonSafely(response);
+    if (response.ok && payload !== null) {
+      void persistMapperCache(path, response.status, payload);
+    }
+
     return {
       ok: response.ok,
       status: response.status,
@@ -149,14 +238,27 @@ const fetchMapperPath = async (path: string) => {
       error: response.ok
         ? undefined
         : String(payload?.message || payload?.error || `Mapper request failed with ${response.status}`),
+      source: "network",
     };
   } catch (error: any) {
+    if (cached && now() <= cached.staleUntil) {
+      return {
+        ok: cached.status >= 200 && cached.status < 300,
+        status: cached.status,
+        latencyMs: now() - start,
+        payload: cached.payload,
+        error: undefined,
+        source: "stale-cache",
+      };
+    }
+
     return {
       ok: false,
       status: 503,
       latencyMs: now() - start,
       payload: null,
       error: error?.message || "Mapper request failed",
+      source: "network-error",
     };
   }
 };
@@ -270,4 +372,9 @@ export const isSupportedMangaMapperProvider = (provider: string) =>
 export const getMapperBridgeConfig = () => ({
   baseUrl: readBaseUrl(),
   timeoutMs: readTimeoutMs(),
+  cache: {
+    directory: MANGA_MAPPER_CACHE_DIR,
+    ttlMs: MAPPER_CACHE_TTL_MS,
+    staleMs: MAPPER_CACHE_STALE_MS,
+  },
 });

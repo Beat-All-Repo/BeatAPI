@@ -10,6 +10,7 @@ export const cf_signatures = [
 // @ts-ignore
 import { connect } from "puppeteer-real-browser";
 import { Logger } from "../utils/logger.js";
+import { ensureBrowserRuntime } from "./browser-runtime-bootstrap.js";
 
 interface ClearanceResult {
   success: boolean;
@@ -41,11 +42,18 @@ export async function getCloudflareClearance(targetUrl: string): Promise<Clearan
     if (!browserInstance || !browserInstance.isConnected() || !pageInstance || pageInstance.isClosed()) {
       Logger.info("Cold start: Launching persistent browser...");
       if (browserInstance) await browserInstance.close().catch(() => {});
+      const runtime = ensureBrowserRuntime();
+
+      if (!runtime.chromePath) {
+        throw new Error(
+          "No Chrome/Chromium executable found. Set CHROME_PATH or enable auto install with CF_BYPASS_AUTO_INSTALL=true."
+        );
+      }
       
       const { browser, page } = await connect({
         headless: "new" as any,       
         turnstile: true,       
-        disableXvfb: false,    
+        disableXvfb: !runtime.hasXvfb,
         ignoreAllFlags: false  
       });
       

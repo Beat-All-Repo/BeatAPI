@@ -185,8 +185,10 @@ import { pino } from "pino";
 function isDevEnv() {
   return !process.env.NODE_ENV || process.env.NODE_ENV === "development" || process.env.NODE_ENV === "test";
 }
+var ANIWATCH_PKG_LOG_LEVEL = process.env.ANIWATCH_PKG_LOG_LEVEL || (isDevEnv() ? "info" : "warn");
+var aniwatchVerboseEnabled = String(process.env.ANIWATCH_PKG_VERBOSE || (isDevEnv() ? "true" : "false")).toLowerCase() === "true";
 var loggerOptions = {
-  level: "info",
+  level: ANIWATCH_PKG_LOG_LEVEL,
   transport: isDevEnv() ? {
     target: "pino-pretty",
     options: {
@@ -206,6 +208,26 @@ var loggerOptions = {
   timestamp: pino.stdTimeFunctions.isoTime
 };
 var log = pino(loggerOptions);
+var aniwatchErrorRateState = /* @__PURE__ */ new Map();
+function shouldLogAniwatchError(key, intervalMs = 2e4) {
+  const now2 = Date.now();
+  const last = aniwatchErrorRateState.get(key) || 0;
+  if (now2 - last < intervalMs) {
+    return false;
+  }
+  aniwatchErrorRateState.set(key, now2);
+  return true;
+}
+var aniwatchInfoRateState = /* @__PURE__ */ new Map();
+function shouldLogAniwatchInfo(key, intervalMs = 1e4) {
+  const now2 = Date.now();
+  const last = aniwatchInfoRateState.get(key) || 0;
+  if (now2 - last < intervalMs) {
+    return false;
+  }
+  aniwatchInfoRateState.set(key, now2);
+  return true;
+}
 
 // src/hianime/error.ts
 var ANSI_ESC_CODE_COLOR_RED = "\x1B[31m";
@@ -251,16 +273,24 @@ var HiAnimeError = class _HiAnimeError extends Error {
     };
   }
   logError() {
+    const payload = {
+      status: this.status,
+      scraper: this.scraper,
+      message: this.message
+    };
+    const key = `${this.scraper}:${this.status}:${this.message}`;
+    if (!shouldLogAniwatchError(key, this.status >= 500 ? 2e4 : 1e4)) {
+      return;
+    }
+    if (this.status === 503) {
+      log.warn(payload, "aniwatch upstream unavailable");
+      return;
+    }
+    if (this.status === 404 && !isDevEnv()) {
+      return;
+    }
     log.error(
-      ANSI_ESC_CODE_COLOR_RED + JSON.stringify(
-        {
-          status: this.status,
-          scraper: this.scraper,
-          message: this.message
-        },
-        null,
-        2
-      ) + ANSI_ESC_CODE_COLOR_RESET
+      ANSI_ESC_CODE_COLOR_RED + JSON.stringify(payload, null, 2) + ANSI_ESC_CODE_COLOR_RESET
     );
   }
 };
@@ -2168,7 +2198,9 @@ async function _getAnimeEpisodeSources(episodeId, server = "hd-1" /* VidStreamin
     }
   }
   const epId = new URL(`/watch/${episodeId}`, SRC_BASE_URL).href;
-  log.info(`EPISODE_ID: ${epId}`);
+  if (aniwatchVerboseEnabled && shouldLogAniwatchInfo(`episode-id:${epId}`, 2e4)) {
+    log.info(`EPISODE_ID: ${epId}`);
+  }
 
   const getTempDirectSources = async (serverId) => {
     const { data: sourcesData } = await client.get(
@@ -2305,11 +2337,15 @@ async function _getAnimeEpisodeSources(episodeId, server = "hd-1" /* VidStreamin
     const $ = load13(resp.data.html);
     let serverId = null;
     try {
-      log.info(`THE SERVER: ${JSON.stringify(server)}`);
+      if (aniwatchVerboseEnabled && shouldLogAniwatchInfo(`server:${String(server)}`, 2e4)) {
+        log.info(`THE SERVER: ${JSON.stringify(server)}`);
+      }
       switch (server) {
         case "hd-1" /* VidStreaming */: {
           serverId = retrieveServerId($, 4, category);
-          log.info(`SERVER_ID: ${serverId}`);
+          if (aniwatchVerboseEnabled && shouldLogAniwatchInfo(`server-id:${String(serverId)}`, 2e4)) {
+            log.info(`SERVER_ID: ${serverId}`);
+          }
           if (!serverId) throw new Error("VidStreaming not found");
           break;
         }
@@ -2376,7 +2412,9 @@ async function _getAnimeEpisodeSources(episodeId, server = "hd-1" /* VidStreamin
     if (!link) {
       throw new Error("Missing link in sources data");
     }
-    log.info(`THE LINK: ${link}`);
+    if (aniwatchVerboseEnabled && shouldLogAniwatchInfo(`link:${String(link).slice(0, 80)}`, 3e4)) {
+      log.info(`THE LINK: ${link}`);
+    }
     try {
       return await _getAnimeEpisodeSources(link, server);
     } catch (err) {
@@ -2419,7 +2457,9 @@ async function getAnimeEpisodeSources(episodeId, server, category) {
         }
       })
     ]);
-    log.info(`EPISODE_SRC_DATA: ${JSON.stringify(episodeSrcData)}`);
+    if (aniwatchVerboseEnabled && shouldLogAniwatchInfo(`episode-src:${episodeId}`, 3e4)) {
+      log.info(`EPISODE_SRC_DATA: ${JSON.stringify(episodeSrcData)}`);
+    }
     const $ = load13(animeSrc?.data);
     try {
       anilistID = Number(

@@ -2,11 +2,9 @@ import { HiAnimeError } from "../vendor/aniwatch/errors/HiAnimeError.js";
 import type { ErrorHandler, NotFoundHandler } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { env } from "./env.js";
-import { log } from "./logger.js";
+import { log, logRateLimited } from "./logger.js";
 
 export const errorHandler: ErrorHandler = (err, c) => {
-    log.error({ err, path: c.req.path, method: c.req.method }, "request error");
-
     let status: ContentfulStatusCode = 500;
     let message = "Internal Server Error";
 
@@ -14,6 +12,28 @@ export const errorHandler: ErrorHandler = (err, c) => {
         status = err.status as ContentfulStatusCode;
         message = err.message;
     }
+
+    const path = c.req.path;
+    const method = c.req.method;
+    const noiseKey = `${method}:${path}:${status}:${message}`;
+    const isUpstreamOrExpectedFailure =
+        status === 403 ||
+        status === 404 ||
+        status === 429 ||
+        status === 503 ||
+        /service unavailable|status 403|not found|fetcherror/i.test(message);
+
+    logRateLimited(
+        `err:${noiseKey}`,
+        () => {
+            if (isUpstreamOrExpectedFailure) {
+                log.warn({ path, method, status, message }, "request error (rate-limited)");
+                return;
+            }
+            log.error({ err, path, method }, "request error");
+        },
+        isUpstreamOrExpectedFailure ? 15000 : 5000
+    );
 
     return c.json(
         {

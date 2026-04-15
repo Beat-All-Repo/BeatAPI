@@ -1,6 +1,6 @@
 import type { MiddlewareHandler } from "hono";
 import { env } from "../config/env.js";
-import { log } from "../config/logger.js";
+import { log, logRateLimited } from "../config/logger.js";
 
 const HEALTH_PATHS = new Set(["/health", "/v"]);
 const SLOW_REQUEST_MS = 1500;
@@ -24,13 +24,24 @@ export const logging: MiddlewareHandler = async (c, next) => {
         durationMs,
     };
 
+    const spamKey = `${method}:${pathname}:${status}`;
+    const isMapperUpstreamFailure = status === 503 && pathname.startsWith("/api/v2/manga/mapper/");
+
     if (status >= 500) {
-        log.error(payload, "request failed");
+        logRateLimited(`req:error:${spamKey}`, () => {
+            if (isMapperUpstreamFailure) {
+                log.warn(payload, "mapper upstream unavailable (rate-limited)");
+                return;
+            }
+            log.error(payload, "request failed");
+        }, 15000);
         return;
     }
 
     if (status >= 400 || durationMs >= SLOW_REQUEST_MS) {
-        log.warn(payload, status >= 400 ? "request warning" : "slow request");
+        logRateLimited(`req:warn:${spamKey}:${durationMs >= SLOW_REQUEST_MS ? "slow" : "http"}`, () => {
+            log.warn(payload, status >= 400 ? "request warning" : "slow request");
+        }, 10000);
         return;
     }
 

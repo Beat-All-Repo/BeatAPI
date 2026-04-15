@@ -3,7 +3,7 @@ import { HiAnime } from "../vendor/aniwatch/index.js";
 import type * as AniwatchTypes from "../vendor/aniwatch/types/index.js";
 import type { AZListSortOptions } from "../vendor/aniwatch/utils/constants.js";
 import { cache } from "../config/cache.js";
-import { isVerboseLoggingEnabled, log } from "../config/logger.js";
+import { isVerboseLoggingEnabled, log, logRateLimited } from "../config/logger.js";
 import type { ServerContext } from "../config/context.js";
 import { extractCompatStreamingInfo } from "../services/hianimeCompat.js";
 
@@ -32,6 +32,10 @@ type TimedValue<T> = {
 const META_LOOKUP_TTL_MS = 6 * 60 * 60 * 1000;
 const POSTER_LOOKUP_TTL_MS = 12 * 60 * 60 * 1000;
 const LOOKUP_CACHE_MAX_ENTRIES = 4000;
+const META_UPSTREAM_FAILURE_THRESHOLD = 8;
+const META_UPSTREAM_DEGRADED_TTL_MS = 2 * 60 * 1000;
+let metaUpstreamFailureStreak = 0;
+let metaUpstreamDegradedUntil = 0;
 
 const animeMetaLookupCache = new Map<string, TimedValue<AnimeMeta>>();
 const animeMetaLookupInflight = new Map<string, Promise<AnimeMeta>>();
@@ -152,6 +156,9 @@ const isAnimeLikeObject = (value: unknown): value is Record<string, unknown> => 
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const isTransientMetaUpstreamError = (message: string) =>
+    /service unavailable|fetcherror|timed out|timeout|503/i.test(message);
+
 const withTimeout = async <T>(
     promise: Promise<T>,
     ms: number,
@@ -234,6 +241,12 @@ const resolveAnimeMeta = async (animeId: string): Promise<AnimeMeta> => {
     const cached = getTimedCacheValue(animeMetaLookupCache, animeId);
     if (cached) return cached;
 
+    if (Date.now() < metaUpstreamDegradedUntil) {
+        const meta: AnimeMeta = { anilistID: null, malID: null, poster: null, banner: null };
+        setTimedCacheValue(animeMetaLookupCache, animeId, meta, 5 * 60 * 1000);
+        return meta;
+    }
+
     const inflight = animeMetaLookupInflight.get(animeId);
     if (inflight) return inflight;
 
@@ -254,12 +267,43 @@ const resolveAnimeMeta = async (animeId: string): Promise<AnimeMeta> => {
                 poster: null,
                 banner: null,
             };
+            metaUpstreamFailureStreak = 0;
+            metaUpstreamDegradedUntil = 0;
             setTimedCacheValue(animeMetaLookupCache, animeId, meta, META_LOOKUP_TTL_MS);
             return meta;
         } catch (err) {
             const message = (err as Error).message || "unknown error";
             if (!/not found/i.test(message)) {
-                log.warn({ animeId, message }, "failed to resolve anime meta");
+                if (isTransientMetaUpstreamError(message)) {
+                    metaUpstreamFailureStreak += 1;
+                    if (metaUpstreamFailureStreak >= META_UPSTREAM_FAILURE_THRESHOLD) {
+                        metaUpstreamDegradedUntil = Date.now() + META_UPSTREAM_DEGRADED_TTL_MS;
+                        logRateLimited(
+                            "meta-upstream-degraded",
+                            () => {
+                                log.warn(
+                                    {
+                                        until: new Date(metaUpstreamDegradedUntil).toISOString(),
+                                        failureStreak: metaUpstreamFailureStreak,
+                                    },
+                                    "anime meta upstream degraded; temporarily serving cached fallback"
+                                );
+                            },
+                            15000
+                        );
+                    }
+                    logRateLimited(
+                        "meta-upstream-transient",
+                        () => log.warn({ animeId, message }, "failed to resolve anime meta (rate-limited)"),
+                        15000
+                    );
+                } else {
+                    logRateLimited(
+                        `meta-resolve:${animeId}`,
+                        () => log.warn({ animeId, message }, "failed to resolve anime meta"),
+                        30000
+                    );
+                }
             }
             const meta: AnimeMeta = { anilistID: null, malID: null, poster: null, banner: null };
             setTimedCacheValue(animeMetaLookupCache, animeId, meta, 30 * 60 * 1000);
