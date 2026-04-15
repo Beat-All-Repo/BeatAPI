@@ -3,11 +3,16 @@ import { HiAnime } from "../vendor/aniwatch/index.js";
 import type * as AniwatchTypes from "../vendor/aniwatch/types/index.js";
 import type { AZListSortOptions } from "../vendor/aniwatch/utils/constants.js";
 import { cache } from "../config/cache.js";
+import { isVerboseLoggingEnabled, log } from "../config/logger.js";
 import type { ServerContext } from "../config/context.js";
-import { extractCompatServers, extractCompatStreamingInfo } from "../services/hianimeCompat.js";
+import { extractCompatStreamingInfo } from "../services/hianimeCompat.js";
 
 const hianime = new HiAnime.Scraper();
 const tatakaiRouter = new Hono<ServerContext>();
+
+const META_RESOLVE_CONCURRENCY = 6;
+const HIANIME_INFO_TIMEOUT_MS = 12000;
+const HIANIME_INFO_RETRY_COUNT = 2;
 
 type IdPair = {
     anilistID: number | null;
@@ -19,10 +24,51 @@ type AnimeMeta = IdPair & {
     banner: string | null;
 };
 
-const animeMetaLookupCache = new Map<string, AnimeMeta>();
+type TimedValue<T> = {
+    value: T;
+    expiresAt: number;
+};
+
+const META_LOOKUP_TTL_MS = 6 * 60 * 60 * 1000;
+const POSTER_LOOKUP_TTL_MS = 12 * 60 * 60 * 1000;
+const LOOKUP_CACHE_MAX_ENTRIES = 4000;
+
+const animeMetaLookupCache = new Map<string, TimedValue<AnimeMeta>>();
 const animeMetaLookupInflight = new Map<string, Promise<AnimeMeta>>();
-const anilistPosterLookupCache = new Map<string, { poster: string | null; banner: string | null } | null>();
+const anilistPosterLookupCache = new Map<
+    string,
+    TimedValue<{ poster: string | null; banner: string | null } | null>
+>();
 const anilistPosterLookupInflight = new Map<string, Promise<{ poster: string | null; banner: string | null } | null>>();
+
+const evictOldestIfNeeded = <T>(cacheMap: Map<string, TimedValue<T>>) => {
+    if (cacheMap.size <= LOOKUP_CACHE_MAX_ENTRIES) return;
+    const firstKey = cacheMap.keys().next().value;
+    if (firstKey) cacheMap.delete(firstKey);
+};
+
+const setTimedCacheValue = <T>(
+    cacheMap: Map<string, TimedValue<T>>,
+    key: string,
+    value: T,
+    ttlMs: number
+) => {
+    cacheMap.set(key, { value, expiresAt: Date.now() + ttlMs });
+    evictOldestIfNeeded(cacheMap);
+};
+
+const getTimedCacheValue = <T>(
+    cacheMap: Map<string, TimedValue<T>>,
+    key: string
+): T | undefined => {
+    const cached = cacheMap.get(key);
+    if (!cached) return undefined;
+    if (Date.now() > cached.expiresAt) {
+        cacheMap.delete(key);
+        return undefined;
+    }
+    return cached.value;
+};
 
 const coerceId = (value: unknown): number | null => {
     if (typeof value === "number" && Number.isFinite(value)) {
@@ -80,12 +126,90 @@ const isAnimeSlug = (value: unknown): value is string => {
 const isAnimeLikeObject = (value: unknown): value is Record<string, unknown> => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
     const obj = value as Record<string, unknown>;
+
+    const hasAnimeSignals =
+        typeof obj.type === "string" ||
+        typeof obj.duration === "string" ||
+        typeof obj.rank === "number" ||
+        typeof obj.episodes === "object" ||
+        typeof obj.jname === "string";
+
+    const hasCharacterSignals =
+        "voiceActors" in obj ||
+        "voiceActor" in obj ||
+        "role" in obj ||
+        "character" in obj;
+
     return (
         isAnimeSlug(obj.id) &&
+        hasAnimeSignals &&
+        !hasCharacterSignals &&
         (typeof obj.name === "string" ||
             typeof obj.jname === "string" ||
             typeof obj.poster === "string")
     );
+};
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const withTimeout = async <T>(
+    promise: Promise<T>,
+    ms: number,
+    label: string
+): Promise<T> => {
+    const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    });
+
+    return Promise.race([promise, timeoutPromise]);
+};
+
+const getAnimeInfoReliable = async (animeId: string) => {
+    let lastError: unknown = null;
+
+    for (let attempt = 0; attempt <= HIANIME_INFO_RETRY_COUNT; attempt++) {
+        try {
+            return await withTimeout(
+                hianime.getInfo(animeId),
+                HIANIME_INFO_TIMEOUT_MS,
+                `hianime.getInfo(${animeId})`
+            );
+        } catch (err) {
+            lastError = err;
+            if (attempt >= HIANIME_INFO_RETRY_COUNT) break;
+            const backoff = 250 * Math.pow(2, attempt);
+            await sleep(backoff);
+        }
+    }
+
+    throw lastError instanceof Error
+        ? lastError
+        : new Error(`Failed to fetch anime info for ${animeId}`);
+};
+
+const mapWithConcurrency = async <T, R>(
+    items: T[],
+    concurrency: number,
+    mapper: (item: T, index: number) => Promise<R>
+) => {
+    const safeConcurrency = Math.max(1, Math.min(concurrency, 16));
+    const results = new Array<R>(items.length);
+    let cursor = 0;
+
+    const worker = async () => {
+        while (true) {
+            const current = cursor;
+            cursor += 1;
+            if (current >= items.length) break;
+            results[current] = await mapper(items[current], current);
+        }
+    };
+
+    await Promise.all(
+        Array.from({ length: Math.min(safeConcurrency, items.length) }, () => worker())
+    );
+
+    return results;
 };
 
 const collectAnimeIds = (value: unknown, out: Set<string>, skipKey?: string) => {
@@ -107,28 +231,38 @@ const collectAnimeIds = (value: unknown, out: Set<string>, skipKey?: string) => 
 };
 
 const resolveAnimeMeta = async (animeId: string): Promise<AnimeMeta> => {
-    const cached = animeMetaLookupCache.get(animeId);
+    const cached = getTimedCacheValue(animeMetaLookupCache, animeId);
     if (cached) return cached;
 
     const inflight = animeMetaLookupInflight.get(animeId);
     if (inflight) return inflight;
 
-    console.log(`[Tatakai] Resolving meta for: ${animeId}`);
     const promise = (async () => {
         try {
-            const info = await hianime.getInfo(animeId);
+            const info = await cache.getOrSet(
+                async () => getAnimeInfoReliable(animeId),
+                `meta:anime-info:${animeId}`,
+                60 * 60,
+                {
+                    staleWhileRevalidateSeconds: 6 * 60 * 60,
+                    allowStaleOnError: true,
+                }
+            );
             const meta: AnimeMeta = {
                 anilistID: info?.anime?.info?.anilistId ?? null,
                 malID: info?.anime?.info?.malId ?? null,
                 poster: null,
                 banner: null,
             };
-            animeMetaLookupCache.set(animeId, meta);
+            setTimedCacheValue(animeMetaLookupCache, animeId, meta, META_LOOKUP_TTL_MS);
             return meta;
         } catch (err) {
-            console.error(`[Tatakai] Failed to resolve meta for ${animeId}:`, (err as Error).message);
+            const message = (err as Error).message || "unknown error";
+            if (!/not found/i.test(message)) {
+                log.warn({ animeId, message }, "failed to resolve anime meta");
+            }
             const meta: AnimeMeta = { anilistID: null, malID: null, poster: null, banner: null };
-            animeMetaLookupCache.set(animeId, meta);
+            setTimedCacheValue(animeMetaLookupCache, animeId, meta, 30 * 60 * 1000);
             return meta;
         } finally {
             animeMetaLookupInflight.delete(animeId);
@@ -150,7 +284,7 @@ const resolveAnilistPoster = async (
         ? `anilist:${validAniListId}`
         : `mal:${validMalId}`;
 
-    const cached = anilistPosterLookupCache.get(cacheKey);
+    const cached = getTimedCacheValue(anilistPosterLookupCache, cacheKey);
     if (cached !== undefined) return cached;
 
     const inflight = anilistPosterLookupInflight.get(cacheKey);
@@ -176,7 +310,7 @@ const resolveAnilistPoster = async (
             });
 
             if (!resp.ok) {
-                anilistPosterLookupCache.set(cacheKey, null);
+                setTimedCacheValue(anilistPosterLookupCache, cacheKey, null, 30 * 60 * 1000);
                 return null;
             }
 
@@ -191,10 +325,10 @@ const resolveAnilistPoster = async (
             const banner = json?.data?.Media?.bannerImage || null;
 
             const result = { poster, banner };
-            anilistPosterLookupCache.set(cacheKey, result);
+            setTimedCacheValue(anilistPosterLookupCache, cacheKey, result, POSTER_LOOKUP_TTL_MS);
             return result;
         } catch {
-            anilistPosterLookupCache.set(cacheKey, null);
+            setTimedCacheValue(anilistPosterLookupCache, cacheKey, null, 30 * 60 * 1000);
             return null;
         } finally {
             anilistPosterLookupInflight.delete(cacheKey);
@@ -242,7 +376,7 @@ const resolveExternalAnimeId = async (inputAnimeId: string): Promise<string> => 
             return foundId;
         }
     } catch (err) {
-        console.error(`[Mapping] Failed to resolve ${animeId}:`, err);
+        log.warn({ animeId, err }, "failed to resolve external anime mapping");
     }
 
     return animeId;
@@ -308,8 +442,10 @@ const enrichAnimeObjectsWithIds = async <T>(data: T): Promise<T> => {
     if (ids.size === 0) return data;
 
     const lookup = new Map<string, AnimeMeta>();
-    await Promise.all(
-        Array.from(ids).map(async (animeId) => {
+    await mapWithConcurrency(
+        Array.from(ids),
+        META_RESOLVE_CONCURRENCY,
+        async (animeId) => {
             const resolvedMeta = await resolveAnimeMeta(animeId);
             const extra = await resolveAnilistPoster(resolvedMeta);
 
@@ -318,7 +454,7 @@ const enrichAnimeObjectsWithIds = async <T>(data: T): Promise<T> => {
                 poster: extra?.poster ?? resolvedMeta.poster,
                 banner: extra?.banner ?? resolvedMeta.banner,
             });
-        })
+        }
     );
 
     return addIdsToAnimeObjects(data, lookup) as T;
@@ -339,7 +475,9 @@ const attachIdsToPayload = <T>(data: T, ids: IdPair): T => {
 };
 
 const ok = async <T>(data: T) => {
-    console.log(`[Tatakai] Processing response with ok()`);
+    if (isVerboseLoggingEnabled) {
+        log.debug("processing response in ok() helper");
+    }
     try {
         const enrichedData = await enrichAnimeObjectsWithIds(data);
         const ids = findIdsDeep(enrichedData);
@@ -352,7 +490,7 @@ const ok = async <T>(data: T) => {
             data: attachIdsToPayload(enrichedData, ids),
         };
     } catch (err) {
-        console.error(`[Tatakai] Error in ok():`, err);
+        log.error({ err }, "ok() helper failed");
         throw err;
     }
 };
@@ -378,6 +516,93 @@ const normalizeServerName = (name: string) => {
 
 // /api/v2/hianime
 tatakaiRouter.get("/", (c) => c.redirect("/", 301));
+
+// Explicit Aliases for backward compatibility
+tatakaiRouter.get("/stream", async (c) => {
+    const query = c.req.query();
+    const animeEpisodeId = decodeURIComponent(query.id || query.animeEpisodeId || "");
+    const server = decodeURIComponent(query.server || "HD-1") as AniwatchTypes.AnimeServers;
+    const category = decodeURIComponent(query.type || query.category || "sub") as "sub" | "dub" | "raw";
+
+    const [sourcesRaw, serversRaw] = await Promise.all([
+        hianime.getEpisodeSources(animeEpisodeId, server, category),
+        hianime.getEpisodeServers(animeEpisodeId),
+    ]);
+
+    const sources = sourcesRaw as any;
+    const servers = serversRaw as any;
+
+    const mergedServers = [
+        ...(servers.sub || []).map((item: any) => ({
+            type: "sub",
+            data_id: item.dataId || null,
+            server_id: item.serverId,
+            serverName: normalizeServerName(item.serverName),
+        })),
+        ...(servers.dub || []).map((item: any) => ({
+            type: "dub",
+            data_id: item.dataId || null,
+            server_id: item.serverId,
+            serverName: normalizeServerName(item.serverName),
+        })),
+        ...(servers.raw || []).map((item: any) => ({
+            type: "raw",
+            data_id: item.dataId || null,
+            server_id: item.serverId,
+            serverName: normalizeServerName(item.serverName),
+        })),
+    ];
+
+    const response = {
+        streamingLink: [
+            {
+                link: sources.sources?.[0]?.url || "",
+                type: sources.sources?.[0]?.type || "hls",
+                server: normalizeServerName(server),
+                iframe: sources.embedURL || "",
+            },
+        ],
+        tracks: sources.tracks || [],
+        subtitles: sources.subtitles || [],
+        intro: sources.intro || null,
+        outro: sources.outro || null,
+        server: normalizeServerName(server),
+        servers: mergedServers,
+        anilistID: sources.anilistID ?? null,
+        malID: sources.malID ?? null,
+    };
+
+    return c.json({ success: true, results: response }, 200);
+});
+
+tatakaiRouter.get("/servers/:episodeId", async (c) => {
+    const animeEpisodeId = decodeURIComponent(c.req.param("episodeId") || "");
+    const serversRaw = await hianime.getEpisodeServers(animeEpisodeId);
+    const servers = serversRaw as any;
+
+    const mergedServers = [
+        ...(servers.sub || []).map((item: any) => ({
+            type: "sub",
+            data_id: item.dataId || null,
+            server_id: item.serverId,
+            serverName: normalizeServerName(item.serverName),
+        })),
+        ...(servers.dub || []).map((item: any) => ({
+            type: "dub",
+            data_id: item.dataId || null,
+            server_id: item.serverId,
+            serverName: normalizeServerName(item.serverName),
+        })),
+        ...(servers.raw || []).map((item: any) => ({
+            type: "raw",
+            data_id: item.dataId || null,
+            server_id: item.serverId,
+            serverName: normalizeServerName(item.serverName),
+        })),
+    ];
+
+    return c.json({ success: true, results: mergedServers }, 200);
+});
 
 // /api/v2/hianime/home
 tatakaiRouter.get("/home", async (c) => {
@@ -530,20 +755,26 @@ tatakaiRouter.get("/anime/:animeId", async (c) => {
     const cacheConfig = c.get("CACHE_CONFIG");
     let animeId = decodeURIComponent(c.req.param("animeId").trim());
 
-    console.log(`[Tatakai] GET /anime/${animeId}`);
+    if (isVerboseLoggingEnabled) {
+        log.debug({ animeId }, "anime route received");
+    }
     animeId = await resolveExternalAnimeId(animeId);
 
     try {
         const data = await cache.getOrSet<AniwatchTypes.ScrapedAnimeAboutInfo>(
             async () => {
-                console.log(`[Tatakai] Fetching info from hianime for: ${animeId}`);
-                return hianime.getInfo(animeId);
+                if (isVerboseLoggingEnabled) {
+                    log.debug({ animeId }, "fetching anime info from hianime");
+                }
+                return getAnimeInfoReliable(animeId);
             },
             cacheConfig.key,
             cacheConfig.duration
         );
 
-        console.log(`[Tatakai] Successfully fetched data for: ${animeId}`);
+        if (isVerboseLoggingEnabled) {
+            log.debug({ animeId }, "anime info fetched successfully");
+        }
         
         // Enrich with AniList poster
         let enrichedData = data;
@@ -567,19 +798,24 @@ tatakaiRouter.get("/anime/:animeId", async (c) => {
                 }
             }
         } catch (posterErr) {
-            console.error(`[Tatakai] Failed to fetch AniList poster for ${animeId}:`, posterErr);
+            log.warn({ animeId, err: posterErr }, "failed to fetch AniList poster");
             // Fallback to original data if poster fetch fails
         }
         
         const result = await ok(enrichedData);
         return c.json(result, { status: 200 });
     } catch (err) {
-        console.error(`[Tatakai] Failed to handle /anime/${animeId}:`, err);
-        return c.json({ error: (err as Error).message, stack: (err as Error).stack }, { status: 500 });
+        log.error({ animeId, err }, "failed to handle anime route");
+        const safeError = {
+            error: (err as Error).message,
+            stack: isVerboseLoggingEnabled ? (err as Error).stack : undefined,
+        };
+        return c.json(safeError, { status: 500 });
     }
 });
 
 // /api/v2/hianime/episode/servers?animeEpisodeId={id}
+// ALIAS: /api/v2/hianime/servers
 tatakaiRouter.get("/episode/servers", async (c) => {
     const cacheConfig = c.get("CACHE_CONFIG");
     const animeEpisodeId = decodeURIComponent(
@@ -587,7 +823,30 @@ tatakaiRouter.get("/episode/servers", async (c) => {
     );
 
     const data = await cache.getOrSet<any>(
-        async () => extractCompatServers(animeEpisodeId),
+        async () => {
+            const serversRaw = await hianime.getEpisodeServers(animeEpisodeId);
+            const servers = serversRaw as any;
+            return [
+                ...(servers.sub || []).map((item: any) => ({
+                    type: "sub",
+                    data_id: item.dataId || null,
+                    server_id: item.serverId,
+                    serverName: normalizeServerName(item.serverName),
+                })),
+                ...(servers.dub || []).map((item: any) => ({
+                    type: "dub",
+                    data_id: item.dataId || null,
+                    server_id: item.serverId,
+                    serverName: normalizeServerName(item.serverName),
+                })),
+                ...(servers.raw || []).map((item: any) => ({
+                    type: "raw",
+                    data_id: item.dataId || null,
+                    server_id: item.serverId,
+                    serverName: normalizeServerName(item.serverName),
+                })),
+            ];
+        },
         cacheConfig.key,
         cacheConfig.duration
     );
@@ -632,7 +891,7 @@ tatakaiRouter.get("/episode/sources", async (c) => {
                 availableServers: streamInfo.servers
             } as AniwatchTypes.ScrapedAnimeEpisodesSources;
         } catch (err) {
-            console.error("[TatakaiCore] Stream Proxy Error:", err);
+            log.error({ err }, "stream proxy extraction failed");
             return { sources: [], subtitles: [] } as any;
         }
     })();
@@ -641,6 +900,7 @@ tatakaiRouter.get("/episode/sources", async (c) => {
 });
 
 // /api/v2/hianime/episode/stream?animeEpisodeId={episodeId}&server={server}&category={category}
+// ALIAS: /api/v2/hianime/stream
 tatakaiRouter.get("/episode/stream", async (c) => {
     const animeEpisodeId = decodeURIComponent(
         c.req.query("animeEpisodeId") || ""

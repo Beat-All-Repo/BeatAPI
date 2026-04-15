@@ -1,6 +1,8 @@
 export const animepahe = "https://animepahe.pw";
 export const animekai = "https://anikai.to";
 export const toonstream = "https://toonstream.dad";
+export const hianime = "https://hianime.to";
+export const aniwatch = "https://aniwatchtv.to";
 
 export const flixhq = "https://flixhq.tw";
 export const yflix = "https://yflix.to";

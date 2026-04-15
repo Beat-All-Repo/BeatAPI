@@ -3,9 +3,16 @@ import { Logger } from "../../utils/logger.js";
 import { browserAjax, browserFetch } from "../animekai/lib/browserFetch.js";
 
 const BASE_URL = "https://animelok.xyz";
-const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+const ANILIST_GRAPHQL_URL = "https://graphql.anilist.co";
+const ANILIST_SEARCH_CACHE_TTL = 6 * 60 * 60 * 1000;
+const ANILIST_SLUG_CACHE_TTL = 6 * 60 * 60 * 1000;
+const ANIMELOK_COMPAT_REFERER = `${BASE_URL}/watch/589da512247b`;
+const ANIMELOK_COMPAT_COOKIE = "_ga=GA1.1.353903388.1775793817; _ga_21XGK270WM=GS2.1.s1775793816$o1$g1$t1775793819$j57$l0$h0";
 let cookieCache = "";
 let cookieCacheAt = 0;
+const anilistSearchCache = new Map<string, { id: number | null; expiresAt: number }>();
+const anilistSlugCache = new Map<number, { slug: string | null; expiresAt: number }>();
 
 async function getSessionCookies(): Promise<string> {
   const now = Date.now();
@@ -98,30 +105,45 @@ async function fetchApi(url: string): Promise<any> {
 
   try {
     const cookieHeader = await getSessionCookies();
+    const watchLike = url.match(/\/api\/anime\/([^/]+)\/episodes\/(\d+)/i);
+    const watchCandidateId = String(watchLike?.[1] || "").trim();
+    const requestReferer = watchLike
+      ? (/^[a-f0-9]{8,}$/i.test(watchCandidateId) ? `${BASE_URL}/watch/${watchCandidateId}` : ANIMELOK_COMPAT_REFERER)
+      : `${BASE_URL}/home`;
+    const mergedCookie = [cookieHeader, ANIMELOK_COMPAT_COOKIE].filter(Boolean).join("; ");
+
     const res = await fetch(url, {
       headers: {
         "User-Agent": UA,
-        Accept: "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        Referer: BASE_URL,
+        Accept: "*/*",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "en-US,en;q=0.6",
+        Connection: "keep-alive",
+        Host: "animelok.xyz",
+        Referer: requestReferer,
         Origin: BASE_URL,
         "X-Requested-With": "XMLHttpRequest",
+        "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Brave";v="146"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Site": "same-origin",
         "Sec-Fetch-Mode": "cors",
-        ...(cookieHeader ? { Cookie: cookieHeader } : {}),
-        "Accept-Encoding": "identity",
+        "Sec-GPC": "1",
+        ...(mergedCookie ? { Cookie: mergedCookie } : {}),
       },
-      redirect: "manual",
-      signal: AbortSignal.timeout(15000),
+      redirect: "follow",
+      signal: AbortSignal.timeout(12000),
     });
     if (!res.ok) {
-      // continue to browser fallback for protected API paths
+      // Log for diagnostics
+      Logger.warn(`[Animelok] API fetch failed: ${url} -> ${res.status}`);
       throw new Error(`HTTP ${res.status}`);
     }
     const text = await res.text();
     if (!isBlockedPayload(text)) {
-      const parsed = parseJsonLoose(text);
-      if (parsed) return parsed;
+        const parsed = parseJsonLoose(text);
+        if (parsed) return parsed;
     }
 
     throw new Error("Direct API blocked or non-JSON payload");
@@ -130,13 +152,15 @@ async function fetchApi(url: string): Promise<any> {
     try {
       await browserFetch(`${BASE_URL}/home`, BASE_URL);
       const watchLike = url.match(/\/api\/anime\/([^/]+)\/episodes\/(\d+)/i);
+      const watchCandidateId = String(watchLike?.[1] || "").trim();
       const referer = watchLike
-        ? `${BASE_URL}/watch/${watchLike[1]}?ep=${watchLike[2]}`
+        ? (/^[a-f0-9]{8,}$/i.test(watchCandidateId) ? `${BASE_URL}/watch/${watchCandidateId}` : ANIMELOK_COMPAT_REFERER)
         : `${BASE_URL}/home`;
       const ajaxRes = await browserAjax(url, {
         method: "GET",
         headers: {
           Accept: "application/json, text/plain, */*",
+          "Accept-Language": "en-US,en;q=0.6",
           "X-Requested-With": "XMLHttpRequest",
           Referer: referer,
         },
@@ -153,8 +177,357 @@ async function fetchApi(url: string): Promise<any> {
 }
 
 function extractAnilistId(slug: string): number | null {
-  const m = slug.match(/-(\d+)$/);
-  return m ? parseInt(m[1], 10) : null;
+  const normalized = String(slug || "").trim();
+  if (!normalized) return null;
+
+  // Prefer explicit AniList markers when present.
+  const explicitMatch = normalized.match(/(?:^|[^a-z0-9])anilist(?:[_-]?id)?[_-]?(\d{2,9})(?:$|[^0-9])/i);
+  if (explicitMatch?.[1]) return toPositiveInt(explicitMatch[1]);
+
+  // Legacy Animelok slug format embeds small AniList IDs at tail (e.g. one-piece-21, naruto-shippuden-1735).
+  // Skip 5+ digit tails to avoid misclassifying HiAnime/internal IDs such as ...-20401.
+  const legacyMatch = normalized.toLowerCase().match(/^[a-z0-9]+(?:-[a-z0-9]+)+-(\d{1,4})$/);
+  if (!legacyMatch?.[1]) return null;
+  return toPositiveInt(legacyMatch[1]);
+}
+
+function slugifyAnimelokTitle(value: string): string {
+  return normalizeTitle(value)
+    .toLowerCase()
+    .replace(/["'`]/g, "")
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function toPositiveInt(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.trunc(value);
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const parsed = Number(trimmed);
+    if (Number.isFinite(parsed) && parsed > 0) return Math.trunc(parsed);
+  }
+  return null;
+}
+
+function decodeLooseText(value?: string): string {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const plusNormalized = raw.replace(/\+/g, " ");
+  try {
+    return decodeURIComponent(plusNormalized);
+  } catch {
+    return plusNormalized;
+  }
+}
+
+function normalizeTitle(value?: string): string {
+  return decodeLooseText(value).replace(/\s+/g, " ").trim();
+}
+
+function isLikelyBrokenTitle(title: string): boolean {
+  const t = normalizeTitle(title);
+  if (!t) return true;
+  const hasReadableWord = /[a-z]{2,}/i.test(t);
+  if (!hasReadableWord) return true;
+
+  const letters = (t.match(/[a-z]/gi) || []).length;
+  if (letters > 0 && letters / t.length < 0.35) return true;
+
+  if (/^[\d.\-+\sA-Z]{6,}$/.test(t) && !/[a-z]/i.test(t)) return true;
+  if (/\+/.test(t) && !/\s\+\s/.test(t)) return true;
+
+  return false;
+}
+
+function extractAnilistIdFromHref(href?: string): number | null {
+  if (!href) return null;
+  try {
+    const parsed = new URL(href.startsWith("http") ? href : `${BASE_URL}${href}`);
+    const queryValue =
+      parsed.searchParams.get("anilist_id") ||
+      parsed.searchParams.get("anilistId") ||
+      parsed.searchParams.get("anilist");
+    return toPositiveInt(queryValue);
+  } catch {
+    const match = href.match(/[?&](?:anilist_id|anilistId|anilist)=(\d+)/i);
+    return match ? toPositiveInt(match[1]) : null;
+  }
+}
+
+function extractAnilistIdFromPoster(poster?: string): number | null {
+  const normalized = decodeLooseText(poster);
+  if (!normalized) return null;
+
+  const coverMatch = normalized.match(/\/bx(\d+)-/i);
+  if (coverMatch?.[1]) return toPositiveInt(coverMatch[1]);
+
+  const queryMatch = normalized.match(/[?&](?:anilist_id|anilistId|anilist)=(\d+)/i);
+  if (queryMatch?.[1]) return toPositiveInt(queryMatch[1]);
+
+  return null;
+}
+
+function scoreAnilistTitleCandidate(searchTitle: string, candidate: any): number {
+  const needle = normalizeTitle(searchTitle).toLowerCase();
+  const haystack = normalizeTitle(
+    candidate?.title?.english ||
+      candidate?.title?.romaji ||
+      candidate?.title?.userPreferred ||
+      candidate?.title?.native ||
+      ""
+  ).toLowerCase();
+
+  if (!needle || !haystack) return 0;
+  if (needle === haystack) return 100;
+
+  let score = 0;
+  const tokens = needle.split(/\s+/).filter(Boolean);
+  for (const token of tokens) {
+    if (haystack.includes(token)) score += 2;
+  }
+  if (haystack.includes(needle)) score += 5;
+  if (needle.includes(haystack)) score += 3;
+  return score;
+}
+
+async function resolveAnilistIdByTitle(title: string): Promise<number | null> {
+  const normalizedTitle = normalizeTitle(title).toLowerCase();
+  if (!normalizedTitle || normalizedTitle.length < 2 || isLikelyBrokenTitle(normalizedTitle)) {
+    return null;
+  }
+
+  const cached = anilistSearchCache.get(normalizedTitle);
+  if (cached && Date.now() <= cached.expiresAt) {
+    return cached.id;
+  }
+
+  try {
+    const response = await fetch(ANILIST_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        query: `
+          query ($search: String) {
+            Page(page: 1, perPage: 5) {
+              media(search: $search, type: ANIME) {
+                id
+                title {
+                  romaji
+                  english
+                  native
+                  userPreferred
+                }
+              }
+            }
+          }
+        `,
+        variables: { search: title },
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!response.ok) {
+      anilistSearchCache.set(normalizedTitle, {
+        id: null,
+        expiresAt: Date.now() + 60 * 1000,
+      });
+      return null;
+    }
+
+    const payload = (await response.json()) as any;
+    const media = Array.isArray(payload?.data?.Page?.media) ? payload.data.Page.media : [];
+    if (media.length === 0) {
+      anilistSearchCache.set(normalizedTitle, {
+        id: null,
+        expiresAt: Date.now() + 10 * 60 * 1000,
+      });
+      return null;
+    }
+
+    const ranked = [...media].sort(
+      (a, b) => scoreAnilistTitleCandidate(title, b) - scoreAnilistTitleCandidate(title, a)
+    );
+    const id = toPositiveInt(ranked[0]?.id);
+
+    anilistSearchCache.set(normalizedTitle, {
+      id,
+      expiresAt: Date.now() + ANILIST_SEARCH_CACHE_TTL,
+    });
+
+    return id;
+  } catch {
+    anilistSearchCache.set(normalizedTitle, {
+      id: null,
+      expiresAt: Date.now() + 60 * 1000,
+    });
+    return null;
+  }
+}
+
+async function resolveAnimelokSlugFromAniListId(anilistId: number): Promise<string | null> {
+  if (!Number.isFinite(anilistId) || anilistId <= 0) return null;
+
+  const cached = anilistSlugCache.get(anilistId);
+  if (cached && Date.now() <= cached.expiresAt) {
+    return cached.slug;
+  }
+
+  try {
+    const response = await fetch(ANILIST_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        query: `
+          query ($id: Int) {
+            Media(id: $id, type: ANIME) {
+              title {
+                english
+                romaji
+                userPreferred
+                native
+              }
+            }
+          }
+        `,
+        variables: { id: anilistId },
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!response.ok) {
+      anilistSlugCache.set(anilistId, {
+        slug: null,
+        expiresAt: Date.now() + 60 * 1000,
+      });
+      return null;
+    }
+
+    const payload = (await response.json()) as any;
+    const media = payload?.data?.Media;
+    const title =
+      media?.title?.english ||
+      media?.title?.romaji ||
+      media?.title?.userPreferred ||
+      media?.title?.native ||
+      "";
+
+    const slugBase = slugifyAnimelokTitle(String(title || ""));
+    const slug = slugBase ? `${slugBase}-${anilistId}` : null;
+
+    anilistSlugCache.set(anilistId, {
+      slug,
+      expiresAt: Date.now() + ANILIST_SLUG_CACHE_TTL,
+    });
+
+    return slug;
+  } catch {
+    anilistSlugCache.set(anilistId, {
+      slug: null,
+      expiresAt: Date.now() + 60 * 1000,
+    });
+    return null;
+  }
+}
+
+function cleanAnimeId(id: string): string {
+  const raw = String(id || "").trim();
+  const withoutQuery = raw.split("?")[0] || raw;
+  return withoutQuery
+    .replace(/^https?:\/\/[^/]+\//i, "")
+    .replace(/^anime\//i, "")
+    .replace(/^watch\//i, "")
+    .replace(/^\/+|\/+$/g, "");
+}
+
+function extractAnimeSlugFromWatchHtml(html: string): string | null {
+  if (!html) return null;
+
+  const directMatch = html.match(/"animeSlug"\s*:\s*"([^"]+)"/i);
+  if (directMatch?.[1]) return directMatch[1];
+
+  const watchDataMatch = html.match(/"anime"\s*:\s*\{[^}]*"slug"\s*:\s*"([^"]+)"/i);
+  if (watchDataMatch?.[1]) return watchDataMatch[1];
+
+  const ogUrlMatch = html.match(/<meta[^>]+property=["']og:url["'][^>]+content=["'][^"']*\/watch\/([^?"']+)/i);
+  if (ogUrlMatch?.[1] && /[a-z]/i.test(ogUrlMatch[1])) return ogUrlMatch[1];
+
+  return null;
+}
+
+async function resolveAnimeSlug(id: string, ep = "1"): Promise<string> {
+  const cleanedId = cleanAnimeId(id);
+  if (!cleanedId) return "";
+
+  // Slug-like IDs are already canonical for /api/anime/{slug}/...
+  if (cleanedId.includes("-") && /[a-z]/i.test(cleanedId)) {
+    return cleanedId;
+  }
+
+  // AniList-style numeric IDs should first try the canonical Animelok slug pattern:
+  // {animename}-{anilistid}
+  if (/^\d+$/.test(cleanedId)) {
+    const numericAniListId = toPositiveInt(cleanedId);
+    if (numericAniListId) {
+      const anilistSlug = await resolveAnimelokSlugFromAniListId(numericAniListId);
+      if (anilistSlug) {
+        const probe = await fetchApi(`${BASE_URL}/api/anime/${encodeURIComponent(anilistSlug)}/episodes/${encodeURIComponent(ep)}`);
+        if (probe?.episode) return anilistSlug;
+      }
+    }
+  }
+
+  // Watch IDs often look like hashes (e.g. /watch/392dac4a0699?ep=1).
+  // Extract the canonical anime slug from the watch page payload.
+  try {
+    const watchHtml = await fetchHtml(`${BASE_URL}/watch/${cleanedId}?ep=${encodeURIComponent(ep)}`, 2);
+    const slugFromWatch = extractAnimeSlugFromWatchHtml(watchHtml);
+    if (slugFromWatch) return slugFromWatch;
+  } catch {
+    // Continue to search fallback.
+  }
+
+  const searchQueries = Array.from(new Set([
+    cleanedId,
+    cleanedId.replace(/-/g, " "),
+  ].filter(Boolean)));
+
+  for (const query of searchQueries) {
+    try {
+      const html = await fetchHtml(`${BASE_URL}/search?keyword=${encodeURIComponent(query)}`, 2);
+      const $ = cheerio.load(html);
+      const candidates = $("a[href^='/anime/']")
+        .map((_, link) => {
+          const href = $(link).attr("href") || "";
+          return cleanAnimeId(href);
+        })
+        .get()
+        .filter(Boolean);
+
+      if (candidates.length === 0) continue;
+
+      if (/^\d+$/.test(cleanedId)) {
+        const exactByAniList = candidates.find((candidate) => candidate.endsWith(`-${cleanedId}`));
+        if (exactByAniList) return exactByAniList;
+      }
+
+      return candidates[0];
+    } catch {
+      // Try next query candidate.
+    }
+  }
+
+  return cleanedId;
 }
 
 function validateItem(item: any): boolean {
@@ -211,14 +584,25 @@ export async function search(q: string) {
     const url = $(link).attr("href");
     if (!url) return;
     const slug = url.split("/").pop() || "";
-    const anilistId = extractAnilistId(slug);
-    const title =
+    const poster =
+      $(link).find("img").attr("src") ||
+      $(link).find("img").attr("data-src") ||
+      $(link).find("img").attr("data-lazy-src");
+    let anilistId =
+      extractAnilistId(slug) ||
+      toPositiveInt($(link).attr("data-anilist-id")) ||
+      toPositiveInt($(link).attr("data-anilistid")) ||
+      toPositiveInt($(link).attr("data-anilist")) ||
+      extractAnilistIdFromHref(url) ||
+      extractAnilistIdFromPoster(poster);
+    const title = normalizeTitle(
       $(link).find("h3, h4").first().text().trim() ||
       $(link).find("[class*='title']").first().text().trim() ||
-      $(link).text().trim().split("\n")[0].trim();
-    const poster =
-      $(link).find("img").attr("src") || $(link).find("img").attr("data-src");
-    if (title && slug) {
+      $(link).find("img").attr("alt") ||
+      $(link).attr("title") ||
+      $(link).text().trim().split("\n")[0].trim()
+    );
+    if (title && slug && !isLikelyBrokenTitle(title)) {
       animes.push({
         id: slug,
         anilistId,
@@ -230,6 +614,18 @@ export async function search(q: string) {
   });
 
   const unique = Array.from(new Map(animes.map(a => [a.id, a])).values());
+
+  const unresolved = unique
+    .filter((anime: any) => !anime.anilistId && anime.title && !isLikelyBrokenTitle(anime.title))
+    .slice(0, 8);
+
+  await Promise.all(
+    unresolved.map(async (anime: any) => {
+      const resolved = await resolveAnilistIdByTitle(anime.title);
+      if (resolved) anime.anilistId = resolved;
+    })
+  );
+
   return { animes: unique };
 }
 
@@ -408,9 +804,10 @@ export async function getLanguageAnime(language: string, page = "1") {
 }
 
 export async function getAnimeInfo(id: string) {
-  const html = await fetchHtml(`${BASE_URL}/anime/${id}`);
+  const resolvedId = await resolveAnimeSlug(id, "1");
+  const html = await fetchHtml(`${BASE_URL}/anime/${resolvedId}`);
   const $ = cheerio.load(html);
-  const anilistId = extractAnilistId(id);
+  const anilistId = extractAnilistId(resolvedId);
 
   const title =
     $("h1").first().text().trim() ||
@@ -457,7 +854,24 @@ export async function getAnimeInfo(id: string) {
 
   // Episodes
   let episodes: any[] = [];
-  if ($("a[href*='/watch/']").length > 0) {
+  const languageHints = ["JAPANESE", "ENGLISH", "HINDI"];
+  for (const lang of languageHints) {
+    const apiData = await fetchApi(`${BASE_URL}/api/anime/${resolvedId}/episodes-range?page=0&lang=${lang}&pageSize=1000`);
+    if (!apiData?.episodes || !Array.isArray(apiData.episodes) || apiData.episodes.length === 0) {
+      continue;
+    }
+
+    episodes = apiData.episodes.map((ep: any) => ({
+      number: ep.number,
+      title: ep.name || `Episode ${ep.number}`,
+      url: `${BASE_URL}/watch/${resolvedId}?ep=${ep.number}`,
+      image: ep.img,
+      isFiller: ep.isFiller,
+    }));
+    break;
+  }
+
+  if (episodes.length === 0 && $("a[href*='/watch/']").length > 0) {
     $("a[href*='/watch/']").each((_, link) => {
       const epUrl = $(link).attr("href");
       const epMatch = epUrl?.match(/ep[=\/](\d+)/i);
@@ -471,23 +885,10 @@ export async function getAnimeInfo(id: string) {
         });
       }
     });
-  } else {
-    const apiData = await fetchApi(`${BASE_URL}/api/anime/${id}/episodes-range?page=0&lang=JAPANESE&pageSize=100`);
-    if (apiData?.episodes) {
-      apiData.episodes.forEach((ep: any) => {
-        episodes.push({
-          number: ep.number,
-          title: ep.name || `Episode ${ep.number}`,
-          url: `${BASE_URL}/watch/${id}?ep=${ep.number}`,
-          image: ep.img,
-          isFiller: ep.isFiller,
-        });
-      });
-    }
   }
 
   return {
-    id,
+    id: resolvedId,
     anilistId,
     title,
     description,
@@ -499,23 +900,80 @@ export async function getAnimeInfo(id: string) {
   };
 }
 
-export async function watch(id: string, ep: string) {
-  let apiUrl = `${BASE_URL}/api/anime/${id}/episodes/${ep}`;
-  let apiData = await fetchApi(apiUrl);
+export async function watch(id: string, ep: string, anilistIdHint?: number | string | null, malIdHint?: number | string | null) {
+  const hintedAniListId = toPositiveInt(anilistIdHint);
+  const hintedMalId = toPositiveInt(malIdHint);
+  const hintedSlug = hintedAniListId ? await resolveAnimelokSlugFromAniListId(hintedAniListId) : null;
+  const resolvedId = hintedSlug || await resolveAnimeSlug(id, ep);
+  const cleanedId = cleanAnimeId(id);
+  const baseWithoutNumericTail = cleanedId.replace(/-\d{1,9}$/i, "");
+  const strippedBase = baseWithoutNumericTail
+    .replace(/-season-\d+(?:-part-\d+)?$/i, "")
+    .replace(/-part-\d+$/i, "");
+  const hintedSlugCandidates = [];
+  if (hintedAniListId) {
+    hintedSlugCandidates.push(`${baseWithoutNumericTail}-${hintedAniListId}`);
+    hintedSlugCandidates.push(`${strippedBase}-${hintedAniListId}`);
+  }
+  if (hintedMalId) {
+    hintedSlugCandidates.push(`${baseWithoutNumericTail}-mal-${hintedMalId}`);
+    hintedSlugCandidates.push(`${strippedBase}-mal-${hintedMalId}`);
+  }
+
+  const idCandidates = Array.from(new Set([hintedSlug, ...hintedSlugCandidates, resolvedId, cleanedId]).values())
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .sort((a, b) => {
+        // Prioritize candidates that contain the hinted anilistId at the end
+        if (hintedAniListId) {
+            const aHasId = a.endsWith(`-${hintedAniListId}`);
+            const bHasId = b.endsWith(`-${hintedAniListId}`);
+            if (aHasId && !bHasId) return -1;
+            if (!aHasId && bHasId) return 1;
+        }
+        return 0;
+    });
+  let apiData: any = null;
+  let activeAnimeId = resolvedId || cleanedId;
+
+  for (const candidateId of idCandidates) {
+    const candidateUrl = `${BASE_URL}/api/anime/${candidateId}/episodes/${ep}`;
+    Logger.info(`[Animelok] Trying candidate: ${candidateId} -> ${candidateUrl}`);
+    try {
+      const candidateData = await fetchApi(candidateUrl);
+      if (candidateData?.episode) {
+        Logger.info(`[Animelok] Success with candidate: ${candidateId}`);
+        apiData = candidateData;
+        activeAnimeId = candidateId;
+        break;
+      }
+    } catch (e) {
+      Logger.warn(`[Animelok] Candidate ${candidateId} failed: ${e}`);
+    }
+  }
 
   // Fallback: resolve real ID via search
   if (!apiData?.episode) {
     Logger.info(`[Animelok] API failed for ${id}, resolving via search`);
     try {
-      const query = id.replace(/-/g, " ");
+      const query = cleanedId.replace(/-\d{1,9}$/i, "").replace(/-/g, " ");
       const html = await fetchHtml(`${BASE_URL}/search?keyword=${encodeURIComponent(query)}`);
       const $ = cheerio.load(html);
-      const firstUrl = $("a[href^='/anime/']").first().attr("href");
-      if (firstUrl) {
-        const realId = firstUrl.split("/").pop();
+      const candidateIds = $("a[href^='/anime/']")
+        .map((_, link) => cleanAnimeId(String($(link).attr("href") || "").split("/").pop() || ""))
+        .get()
+        .filter(Boolean);
+
+      const preferred = hintedAniListId
+        ? candidateIds.find((candidate) => candidate.endsWith(`-${hintedAniListId}`))
+        : undefined;
+      const selectedId = preferred || candidateIds[0];
+
+      if (selectedId) {
+        const realId = cleanAnimeId(selectedId);
         if (realId && realId !== id) {
           Logger.info(`[Animelok] Resolved ${id} → ${realId}`);
           apiData = await fetchApi(`${BASE_URL}/api/anime/${realId}/episodes/${ep}`);
+          if (apiData?.episode) activeAnimeId = realId;
         }
       }
     } catch (e) {
@@ -524,7 +982,7 @@ export async function watch(id: string, ep: string) {
   }
 
   if (!apiData?.episode) {
-    return { id, episode: ep, servers: [], subtitles: [] };
+    return { id: activeAnimeId || id, episode: ep, servers: [], subtitles: [] };
   }
 
   const episodeData = apiData.episode;
@@ -540,39 +998,75 @@ export async function watch(id: string, ep: string) {
     }
     if (!Array.isArray(raw)) return [];
 
-    return raw.map((s: any) => {
-      let language = s.languages?.[0] || s.language || "";
-      const lc = s.langCode || "";
-      if (lc.includes("TAM")) language = "Tamil";
-      else if (lc.includes("MAL")) language = "Malayalam";
-      else if (lc.includes("TEL")) language = "Telugu";
-      else if (lc.includes("KAN")) language = "Kannada";
-      else if (lc.includes("HIN") || s.name?.toLowerCase().includes("cloud") || s.tip?.toLowerCase().includes("cloud")) language = "Hindi";
-      else if (lc.includes("ENG") || lc.includes("EN")) language = "English";
-      else if (lc.includes("JAP")) language = "Japanese";
-      if (!language.trim()) language = "Other";
-      if (["eng", "english"].includes(language.toLowerCase())) language = "English";
-      language = language.charAt(0).toUpperCase() + language.slice(1).toLowerCase();
+    const resolveUrl = (entry: any): string => {
+      let url =
+        entry?.url ||
+        entry?.directUrl ||
+        entry?.src ||
+        entry?.link ||
+        entry?.file ||
+        entry?.proxiedUrl ||
+        "";
 
-      let url = s.url;
-      const isM3U8 = s.isM3U8 || (typeof url === "string" && url.toLowerCase().includes(".m3u8"));
       if (typeof url === "string" && url.trim().startsWith("[")) {
         try {
           const parsed = JSON.parse(url);
-          if (Array.isArray(parsed) && parsed.length > 0) url = parsed[0].url || url;
-        } catch { }
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const first = parsed[0] || {};
+            url = first.url || first.file || first.src || first.link || url;
+          }
+        } catch {
+          // Ignore JSON parsing failures and keep raw url value.
+        }
       }
 
-      return { name: s.name, url, language, tip: s.tip, isM3U8 };
-    }).filter(s => s.url);
+      return typeof url === "string" ? url.trim() : "";
+    };
+
+    const normalized = raw
+      .flatMap((server: any) => {
+        const entries = Array.isArray(server?.sources) && server.sources.length > 0
+          ? server.sources.map((source: any) => ({ ...server, ...source }))
+          : [server];
+
+        return entries.map((entry: any) => {
+          let language = entry.languages?.[0] || entry.language || "";
+          const lc = String(entry.langCode || "");
+          if (lc.includes("TAM")) language = "Tamil";
+          else if (lc.includes("MAL")) language = "Malayalam";
+          else if (lc.includes("TEL")) language = "Telugu";
+          else if (lc.includes("KAN")) language = "Kannada";
+          else if (lc.includes("HIN") || entry.name?.toLowerCase().includes("cloud") || entry.tip?.toLowerCase().includes("cloud")) language = "Hindi";
+          else if (lc.includes("ENG") || lc.includes("EN")) language = "English";
+          else if (lc.includes("JAP")) language = "Japanese";
+          if (!language.trim()) language = "Other";
+          if (["eng", "english"].includes(language.toLowerCase())) language = "English";
+          language = language.charAt(0).toUpperCase() + language.slice(1).toLowerCase();
+
+          const url = resolveUrl(entry);
+          const isM3U8 =
+            Boolean(entry.isM3U8 || entry.type === "hls") ||
+            (typeof url === "string" && url.toLowerCase().includes(".m3u8"));
+
+          return { name: entry.name, url, language, tip: entry.tip, isM3U8 };
+        });
+      })
+      .filter((server: any) => Boolean(server?.url));
+
+    const seen = new Set<string>();
+    return normalized.filter((server: any) => {
+      if (seen.has(server.url)) return false;
+      seen.add(server.url);
+      return true;
+    });
   };
 
   let servers = parseServers(episodeData.servers);
 
   if (servers.length === 0) {
     const [dubData, subData] = await Promise.all([
-      fetchApi(`${BASE_URL}/api/anime/${id}/episodes/${ep}?lang=dub`),
-      fetchApi(`${BASE_URL}/api/anime/${id}/episodes/${ep}?lang=sub`),
+      fetchApi(`${BASE_URL}/api/anime/${activeAnimeId}/episodes/${ep}?lang=dub`),
+      fetchApi(`${BASE_URL}/api/anime/${activeAnimeId}/episodes/${ep}?lang=sub`),
     ]);
     const dubServers = parseServers(dubData?.episode?.servers).map(s => ({ ...s, language: s.language === "Other" ? "Dub" : s.language }));
     const subServers = parseServers(subData?.episode?.servers).map(s => ({ ...s, language: s.language === "Other" ? "Sub" : s.language }));
@@ -596,20 +1090,20 @@ export async function watch(id: string, ep: string) {
   // Episode list for navigation
   let episodes: any[] = [];
   try {
-    const allEps = await fetchApi(`${BASE_URL}/api/anime/${id}/episodes-range?page=0&lang=JAPANESE&pageSize=1000`);
+    const allEps = await fetchApi(`${BASE_URL}/api/anime/${activeAnimeId}/episodes-range?page=0&lang=JAPANESE&pageSize=1000`);
     if (allEps?.episodes) {
       episodes = allEps.episodes.map((e: any) => ({
         number: e.number,
         title: e.name || `Episode ${e.number}`,
-        url: `${BASE_URL}/watch/${id}?ep=${e.number}`,
+        url: `${BASE_URL}/watch/${activeAnimeId}?ep=${e.number}`,
         isFiller: e.isFiller,
       }));
     }
   } catch { }
 
   return {
-    id,
-    anilistId: apiData.anime?.id || extractAnilistId(id),
+    id: activeAnimeId,
+    anilistId: toPositiveInt(apiData.anime?.anilistId) || hintedAniListId || extractAnilistId(activeAnimeId),
     animeTitle: apiData.anime?.title || "Unknown Anime",
     episode: ep,
     title: episodeData.name || `Episode ${ep}`,

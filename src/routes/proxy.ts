@@ -3,32 +3,71 @@ import { ProxyBalancer } from "../lib/proxyBalancer.js";
 
 const proxyRouter = new Hono();
 
-const configuredProxyUrls = (process.env.STREAM_PROXY_URLS || "")
+const DEFAULT_STREAM_PROXY_URLS = [
+    "https://hoko.tatakai.me/api/v1/streamingProxy",
+    "https://moko.tatakai.me/api/v1/streamingProxy",
+];
+
+const configuredProxyUrlsFromEnv = (process.env.STREAM_PROXY_URLS || "")
     .split(",")
     .map((v) => v.trim())
     .filter(Boolean);
 
-if (configuredProxyUrls.length === 0) {
-    configuredProxyUrls.push(
-      "https://api.tatakai.me/api/proxy/m3u8-streaming-proxy",
+const SELF_PROXY_PATH_MARKERS = [
+    "/api/proxy/m3u8-streaming-proxy",
+    "/api/v2/hianime/proxy/m3u8-streaming-proxy",
+    "/api/v2/anime/hianime/proxy/m3u8-streaming-proxy",
+];
 
-        "https://kira.tatakai.me"
-    );
-}
+const LOCAL_HOST_MARKERS = ["localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1"];
+const SELF_HOST_MARKERS = [
+    ...LOCAL_HOST_MARKERS,
+    "api.tatakai.me",
+    String(process.env.ANIWATCH_API_HOSTNAME || "").trim().toLowerCase(),
+].filter(Boolean);
 
 const isSelfProxyNode = (url: string) => {
     const normalized = url.toLowerCase();
-    return (
-        (normalized.includes("localhost:9000") || normalized.includes("127.0.0.1:9000")) &&
-        normalized.includes("/api/proxy/m3u8-streaming-proxy")
-    );
+    const matchesProxyPath = SELF_PROXY_PATH_MARKERS.some((marker) => normalized.includes(marker));
+    if (!matchesProxyPath) return false;
+
+    try {
+        const parsed = new URL(url);
+        const host = parsed.hostname.toLowerCase();
+        if (SELF_HOST_MARKERS.some((marker) => host === marker || host.endsWith(`.${marker}`))) {
+            return true;
+        }
+    } catch {
+        // Fall back to a string check for non-standard values.
+    }
+
+    return SELF_HOST_MARKERS.some((marker) => normalized.includes(marker));
 };
 
-const balancerUrls = configuredProxyUrls.filter((url) => !isSelfProxyNode(url));
+const externalConfiguredProxyUrls = configuredProxyUrlsFromEnv.filter((url) => !isSelfProxyNode(url));
+const hasHokoConfigured = externalConfiguredProxyUrls.some((url) =>
+    url.toLowerCase().includes("hoko.tatakai.me")
+);
+const hasMokoConfigured = externalConfiguredProxyUrls.some((url) =>
+    url.toLowerCase().includes("moko.tatakai.me")
+);
+
+const configuredProxyUrls = hasHokoConfigured && hasMokoConfigured
+    ? externalConfiguredProxyUrls
+    : DEFAULT_STREAM_PROXY_URLS;
+const balancerUrls = configuredProxyUrls;
 
 const DEFAULT_REFERER = process.env.STREAM_PROXY_REFERER || "https://megacloud.club/";
+const STREAM_PROXY_PASSWORD = (
+    process.env.STREAM_PROXY_PASSWORD || process.env.PROXY_PASSWORD || ""
+).trim();
 const DEFAULT_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const FALLBACK_UPSTREAM_PROXY_URL = (
+    process.env.STREAM_PROXY_FALLBACK_URL ||
+    process.env.STREAM_PROXY_DEV_URL ||
+    ""
+).trim();
 
 const balancer = new ProxyBalancer(balancerUrls);
 
@@ -47,12 +86,60 @@ const withTimeout = async <T>(promise: Promise<T>, ms: number): Promise<T> => {
     }
 };
 
-const probeProxyNode = async (url: string) => {
+const fetchWithTimeout = async (url: string, init: RequestInit, timeoutMs = 15000): Promise<Response> => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+        return await fetch(url, {
+            ...init,
+            redirect: "follow",
+            signal: controller.signal,
+        });
+    } finally {
+        clearTimeout(timeout);
+    }
+};
+
+const buildFallbackProxyRequestUrl = (
+    fallbackBaseUrl: string,
+    upstreamUrl: string,
+    referer?: string,
+    userAgent?: string,
+    proxyPassword?: string
+) => {
+    if (!fallbackBaseUrl) return "";
+
+    try {
+        const parsed = new URL(fallbackBaseUrl);
+        parsed.searchParams.set("url", upstreamUrl);
+        if (referer) parsed.searchParams.set("referer", referer);
+        if (userAgent) parsed.searchParams.set("userAgent", userAgent);
+        if (proxyPassword) parsed.searchParams.set("password", proxyPassword);
+        return parsed.toString();
+    } catch {
+        const joiner = fallbackBaseUrl.includes("?") ? "&" : "?";
+        const params = new URLSearchParams({ url: upstreamUrl });
+        if (referer) params.set("referer", referer);
+        if (userAgent) params.set("userAgent", userAgent);
+        if (proxyPassword) params.set("password", proxyPassword);
+        return `${fallbackBaseUrl}${joiner}${params.toString()}`;
+    }
+};
+
+const probeProxyNode = async (url: string, proxyPassword?: string) => {
     const start = performance.now();
     try {
         const probeUrl = isSelfProxyNode(url)
             ? "https://api.tatakai.me/health"
-            : `${url}${url.includes("?") ? "&" : "?"}url=${encodeURIComponent("https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8")}`;
+            : (() => {
+                  const joiner = url.includes("?") ? "&" : "?";
+                  const params = new URLSearchParams({
+                      url: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+                  });
+                  if (proxyPassword) params.set("password", proxyPassword);
+                  return `${url}${joiner}${params.toString()}`;
+              })();
         const resp = await withTimeout(fetch(probeUrl, { method: "GET" }), 4000);
         const latency = Math.round(performance.now() - start);
         const status = resp.status >= 500 ? "offline" : resp.status >= 400 ? "degraded" : "online";
@@ -82,7 +169,7 @@ proxyRouter.get("/status", async (c) => {
                 };
             }
 
-            const probe = await probeProxyNode(url);
+            const probe = await probeProxyNode(url, STREAM_PROXY_PASSWORD);
             return {
                 id: `proxy-${idx + 1}`,
                 url,
@@ -111,7 +198,21 @@ const resolveUrl = (target: string, base: string) => {
     }
 };
 
-const rewritePlaylistUrls = (playlistText: string, baseUrl: string, referer: string, userAgent?: string) => {
+const looksLikeManifest = (payload: string) => {
+    const text = String(payload || "").trim();
+    if (!text) return false;
+    if (!text.startsWith("#EXTM3U")) return false;
+    return text.includes("#EXT-X-") || text.includes("#EXTINF");
+};
+
+const rewritePlaylistUrls = (
+    playlistText: string,
+    baseUrl: string,
+    proxyEndpointPath: string,
+    referer: string,
+    userAgent?: string,
+    proxyPassword?: string
+) => {
     return playlistText
         .split("\n")
         .map((line) => {
@@ -123,8 +224,9 @@ const rewritePlaylistUrls = (playlistText: string, baseUrl: string, referer: str
                 const params = new URLSearchParams({ url: resolved });
                 if (referer) params.set("referer", referer);
                 if (userAgent) params.set("userAgent", userAgent);
+                if (proxyPassword) params.set("password", proxyPassword);
                 params.set("type", "video");
-                return `/api/proxy/m3u8-streaming-proxy?${params.toString()}`;
+                return `${proxyEndpointPath}?${params.toString()}`;
             };
 
             if (trimmed.startsWith("#")) {
@@ -148,8 +250,20 @@ proxyRouter.get("/m3u8-streaming-proxy", async (c) => {
 
     const targetUrl = safeDecode(c.req.query("url")).trim();
     const referer = safeDecode(c.req.query("referer")).trim() || DEFAULT_REFERER;
-    const requestedUserAgent = safeDecode(c.req.query("userAgent")).trim() || DEFAULT_USER_AGENT;
+    const rawUserAgent = safeDecode(c.req.query("userAgent")).trim();
+    const requestedUserAgent = rawUserAgent || DEFAULT_USER_AGENT;
     const requestedRange = c.req.header("range") || "";
+    const requestType = safeDecode(c.req.query("type")).trim().toLowerCase();
+
+    let proxyEndpointPath = "/api/proxy/m3u8-streaming-proxy";
+    try {
+        const pathname = new URL(c.req.url).pathname;
+        if (pathname.endsWith("/m3u8-streaming-proxy")) {
+            proxyEndpointPath = pathname;
+        }
+    } catch {
+        // Keep default path when URL parsing fails.
+    }
 
     if (!targetUrl) {
         return c.json({ success: false, message: "Missing url query param" }, 400);
@@ -170,24 +284,32 @@ proxyRouter.get("/m3u8-streaming-proxy", async (c) => {
                 targetOrigin ? `${targetOrigin}/` : "",
                 referer.replace("megacloud.blog", "megacloud.club"),
                 referer.replace("megacloud.club", "megacloud.blog"),
-                "https://megacloud.club/",
                 "https://megacloud.blog/",
+                "https://megacloud.club/",
                 "https://megacloud.tv/",
                 "https://megaup.cc/",
                 "https://rrr.megaup.cc/",
+                "https://dokicloud.one/",
+                "https://rabbitstream.net/",
             ].filter(Boolean)
         )
     );
 
     const buildHeaders = (ref: string): Record<string, string> => {
+        const isPlaylistRequest = /\.m3u8(?:$|[?#])/i.test(targetUrl);
         const headers: Record<string, string> = {
             "User-Agent": requestedUserAgent,
-            Accept: "*/*",
+            "Accept": isPlaylistRequest
+                ? "application/vnd.apple.mpegurl, application/x-mpegURL, application/octet-stream;q=0.9, */*;q=0.8"
+                : "*/*",
             "Accept-Language": "en-US,en;q=0.9",
             "Cache-Control": "no-cache",
-            Pragma: "no-cache",
+            "Pragma": "no-cache",
         };
-        if (requestedRange) headers.Range = requestedRange;
+
+        // Forward byte ranges for media segments, but avoid ranged playlist requests.
+        if (requestedRange && !isPlaylistRequest) headers.Range = requestedRange;
+
         if (ref) {
             headers.Referer = ref;
             try {
@@ -196,43 +318,81 @@ proxyRouter.get("/m3u8-streaming-proxy", async (c) => {
                 // noop
             }
         }
+
         return headers;
     };
 
     const isPlaylistLike = (response: Response) => {
         const contentType = (response.headers.get("content-type") || "").toLowerCase();
-        return targetUrl.toLowerCase().includes(".m3u8") || contentType.includes("mpegurl") || contentType.includes("x-mpegurl");
+        return /\.m3u8(?:$|[?#])/i.test(targetUrl) || contentType.includes("mpegurl") || contentType.includes("x-mpegurl");
     };
 
-    const hasPlaylistPayload = async (response: Response) => {
-        try {
-            return (await response.clone().text()).trim().length > 0;
-        } catch {
-            return false;
-        }
+    const isLikelyHtmlPayload = (response: Response) => {
+        const contentType = (response.headers.get("content-type") || "").toLowerCase();
+        return contentType.includes("text/html") || contentType.includes("application/json");
     };
 
     try {
         let upstream: Response | null = null;
         let successfulReferer = referer;
+        let playlistBaseUrl = targetUrl;
+        let lastFailure: { status: number; referer: string; via: "direct" | "balancer"; reason: string } = {
+            status: 502,
+            referer,
+            via: "direct",
+            reason: "no acceptable upstream response",
+        };
 
-        const isAcceptableResponse = async (response: Response) => {
-            if (!(response.ok || response.status === 206)) return false;
+        const isAcceptableResponse = async (
+            response: Response,
+            context: { referer: string; via: "direct" | "balancer" }
+        ) => {
+            if (!(response.ok || response.status === 206)) {
+                lastFailure = {
+                    status: response.status,
+                    referer: context.referer,
+                    via: context.via,
+                    reason: `upstream status ${response.status}`,
+                };
+                return false;
+            }
 
             if (isPlaylistLike(response)) {
-                const validPayload = await hasPlaylistPayload(response);
-                if (!validPayload) {
+                const payloadText = await response.clone().text().catch(() => "");
+                if (!looksLikeManifest(payloadText)) {
+                    lastFailure = {
+                        status: response.status,
+                        referer: context.referer,
+                        via: context.via,
+                        reason: "invalid or non-HLS playlist payload",
+                    };
                     return false;
                 }
+            }
+
+            if (requestType === "video" && !isPlaylistLike(response) && isLikelyHtmlPayload(response)) {
+                lastFailure = {
+                    status: response.status,
+                    referer: context.referer,
+                    via: context.via,
+                    reason: "non-media response payload",
+                };
+                return false;
             }
 
             return true;
         };
 
+        const isProxyHop = c.req.header("X-Proxy-Hop") === "1";
+        const isVideoSegment = !targetUrl.toLowerCase().includes(".m3u8") && c.req.query("type") === "video";
+
         for (const ref of refererCandidates) {
             const headers = buildHeaders(ref);
+            if (isProxyHop) headers["X-Proxy-Hop"] = "1";
 
-            if (balancer.hasNodes) {
+            const shouldBypassBalancer = isProxyHop || isVideoSegment;
+
+            if (balancer.hasNodes && !shouldBypassBalancer) {
                 try {
                     const viaBalancer = await balancer.fetch(
                         targetUrl,
@@ -242,32 +402,117 @@ proxyRouter.get("/m3u8-streaming-proxy", async (c) => {
                             referer: ref,
                             userAgent: requestedUserAgent,
                             type: "video",
+                            password: STREAM_PROXY_PASSWORD,
                         }
                     );
-                    if (await isAcceptableResponse(viaBalancer)) {
+                    if (await isAcceptableResponse(viaBalancer, { referer: ref, via: "balancer" })) {
                         upstream = viaBalancer;
                         successfulReferer = ref;
                         break;
+                    } else {
+                        console.warn(`[Proxy Balancer] Failed for ${targetUrl} with ref ${ref}. Status: ${viaBalancer.status}`);
                     }
-                } catch {
-                    // try direct fallback with same headers
+                } catch (e: any) {
+                    lastFailure = {
+                        status: 502,
+                        referer: ref,
+                        via: "balancer",
+                        reason: e?.message ? `balancer error: ${e.message}` : "balancer error",
+                    };
+                    console.error(`[Proxy Balancer] Error for ${targetUrl}:`, e.message);
                 }
             }
 
             try {
-                const direct = await fetch(targetUrl, { method: "GET", headers });
-                if (await isAcceptableResponse(direct)) {
+                const direct = await fetchWithTimeout(targetUrl, { method: "GET", headers }, 15000);
+                if (await isAcceptableResponse(direct, { referer: ref, via: "direct" })) {
                     upstream = direct;
                     successfulReferer = ref;
                     break;
+                } else {
+                    console.warn(`[Proxy Direct] Failed for ${targetUrl} with ref ${ref}. Status: ${direct.status}`);
                 }
-            } catch {
-                // try next referer candidate
+            } catch (e: any) {
+                lastFailure = {
+                    status: 502,
+                    referer: ref,
+                    via: "direct",
+                    reason: e?.message ? `direct fetch error: ${e.message}` : "direct fetch error",
+                };
+                console.error(`[Proxy Direct] Error for ${targetUrl}:`, e.message);
+            }
+        }
+
+        if (!upstream && FALLBACK_UPSTREAM_PROXY_URL) {
+            const fallbackRef = lastFailure.referer || referer;
+            const fallbackRequestUrl = buildFallbackProxyRequestUrl(
+                FALLBACK_UPSTREAM_PROXY_URL,
+                targetUrl,
+                fallbackRef,
+                requestedUserAgent,
+                STREAM_PROXY_PASSWORD,
+            );
+
+            const isRecursiveFallback = (() => {
+                if (!fallbackRequestUrl) return true;
+                try {
+                    const fallbackParsed = new URL(FALLBACK_UPSTREAM_PROXY_URL);
+                    const targetParsed = new URL(targetUrl);
+                    return (
+                        targetParsed.origin === fallbackParsed.origin &&
+                        targetParsed.pathname === fallbackParsed.pathname
+                    );
+                } catch {
+                    return false;
+                }
+            })();
+
+            if (!isRecursiveFallback && fallbackRequestUrl) {
+                try {
+                    const fallbackResponse = await fetchWithTimeout(
+                        fallbackRequestUrl,
+                        {
+                            method: "GET",
+                            headers: {
+                                "Accept": "*/*",
+                                "User-Agent": requestedUserAgent,
+                            },
+                        },
+                        20000
+                    );
+
+                    if (await isAcceptableResponse(fallbackResponse, { referer: fallbackRef, via: "direct" })) {
+                        upstream = fallbackResponse;
+                        successfulReferer = fallbackRef;
+                        playlistBaseUrl = fallbackRequestUrl;
+                    } else {
+                        console.warn(`[Proxy Fallback] Failed for ${targetUrl}. Status: ${fallbackResponse.status}`);
+                    }
+                } catch (e: any) {
+                    lastFailure = {
+                        status: 502,
+                        referer: fallbackRef,
+                        via: "direct",
+                        reason: e?.message ? `fallback proxy error: ${e.message}` : "fallback proxy error",
+                    };
+                    console.error(`[Proxy Fallback] Error for ${targetUrl}:`, e.message);
+                }
             }
         }
 
         if (!upstream) {
-            throw new Error("All proxy/direct attempts failed for upstream stream URL");
+            const statusCode = lastFailure.status >= 400 && lastFailure.status < 600 ? lastFailure.status : 502;
+            return c.json(
+                {
+                    success: false,
+                    message: `Upstream stream request failed: ${lastFailure.reason}`,
+                    target: targetUrl,
+                    refererTried: lastFailure.referer,
+                    via: lastFailure.via,
+                    balancer: balancer.getStats(),
+                },
+                { status: statusCode as any }
+            );
         }
 
         const contentType = upstream.headers.get("content-type") || "";
@@ -279,7 +524,14 @@ proxyRouter.get("/m3u8-streaming-proxy", async (c) => {
                 throw new Error("Upstream playlist response was empty");
             }
 
-            const rewritten = rewritePlaylistUrls(playlist, targetUrl, successfulReferer, requestedUserAgent);
+            const rewritten = rewritePlaylistUrls(
+                playlist,
+                playlistBaseUrl,
+                proxyEndpointPath,
+                successfulReferer,
+                requestedUserAgent,
+                STREAM_PROXY_PASSWORD,
+            );
             return new Response(rewritten, {
                 status: 200,
                 headers: {
@@ -312,6 +564,7 @@ proxyRouter.get("/m3u8-streaming-proxy", async (c) => {
             {
                 success: false,
                 message: (err as Error).message || "Proxy request failed",
+                target: targetUrl,
                 balancer: balancer.getStats(),
             },
             502

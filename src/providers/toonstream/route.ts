@@ -15,7 +15,7 @@ const MOVIE_SOURCES_CACHE_TTL = 3600 * 12;
 const EPISODE_SOURCES_CACHE_TTL = 3600 * 12;
 
 export const PROXIFY = true;
-export const toonstreamRoutes = new Hono().basePath("/toonstream");
+export const toonstreamRoutes = new Hono();
 
 toonstreamRoutes.get("/", (c) => {
   return c.json({

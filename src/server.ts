@@ -17,7 +17,9 @@ import type { ServerContext } from "./config/context.js";
 import { hianimeRouter } from "./routes/hianime.js";
 import { streamRouter } from "./routes/stream.js";
 import { proxyRouter } from "./routes/proxy.js";
+import { mediaRouter } from "./routes/media.js";
 import { animeRoutes } from "./providers/route.js";
+import { mangaRoutes } from "./providers/manga/route.js";
 import { logging } from "./middleware/logging.js";
 import { cacheConfigSetter, cacheControl } from "./middleware/cache.js";
 
@@ -451,11 +453,15 @@ app.get("/docs/:section?", (c) => {
 // hianime-api compatibility endpoints
 app.route("/api", streamRouter);
 app.route("/api/proxy", proxyRouter);
+app.route("/api/v2/hianime/proxy", proxyRouter);
+app.route("/api/v2/anime/hianime/proxy", proxyRouter);
 
 app.use(cacheConfigSetter(BASE_PATH.length));
 
 app.basePath(BASE_PATH).route("/hianime", hianimeRouter);
 app.basePath(BASE_PATH).route("/anime", animeRoutes);
+app.basePath(BASE_PATH).route("/manga", mangaRoutes);
+app.basePath(BASE_PATH).route("/media", mediaRouter);
 app.basePath(BASE_PATH).get("/anicrush", (c) =>
     c.text("Anicrush could be implemented in future.")
 );

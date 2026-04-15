@@ -7,7 +7,7 @@ const HOME_TTL = 3_600;
 const SEARCH_TTL = 1_800;
 const INFO_TTL = 86_400;
 
-export const hindidubbedRoutes = new Hono().basePath("/hindidubbed");
+export const hindidubbedRoutes = new Hono();
 
 hindidubbedRoutes.get("/home", async (c) => {
   const key = "hdb:home";
@@ -61,6 +61,18 @@ hindidubbedRoutes.get("/anime/:slug", async (c) => {
   data = await mapProviderItem(data);
   await Cache.set(key, JSON.stringify(data), INFO_TTL);
   return c.json(data);
+});
+
+hindidubbedRoutes.get("/episode", async (c) => {
+  const url = c.req.query("url");
+  if (!url) return c.json({ error: "Missing url parameter" }, 400);
+
+  try {
+    const data = await extractEpisodeHls(url);
+    return c.json(data);
+  } catch (e: any) {
+    return c.json({ error: e?.message || "Failed to extract episode" }, 500);
+  }
 });
 
 hindidubbedRoutes.get("/episode/hls", async (c) => {

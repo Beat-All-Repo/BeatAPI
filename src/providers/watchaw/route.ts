@@ -11,7 +11,7 @@ const HOME_TTL = 3_600;
 const SEARCH_TTL = 1_800;
 const SOURCES_TTL = 1_800;
 
-export const watchawRoutes = new Hono().basePath("/watchaw");
+export const watchawRoutes = new Hono();
 
 watchawRoutes.get("/home", async (c) => {
   const key = "waw:home";
@@ -48,7 +48,7 @@ watchawRoutes.get("/episode", async (c) => {
         const searchRes = await search(title);
         const matched = searchRes.results?.[0];
         if (matched && matched.slug) {
-          id = `${matched.slug}-1x${episodeNum}`;
+          id = `${matched.slug}-1-${episodeNum}`;
         }
       }
     } catch (e) {

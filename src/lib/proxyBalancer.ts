@@ -12,6 +12,7 @@ const COOLDOWN_MS = 20000;
 
 export class ProxyBalancer {
     private nodes: ProxyHealth[];
+    private rotationCursor = 0;
 
     constructor(urls: string[]) {
         this.nodes = urls
@@ -51,8 +52,17 @@ export class ProxyBalancer {
 
     private pickNode(): ProxyHealth | null {
         if (!this.nodes.length) return null;
-        const sorted = [...this.nodes].sort((a, b) => this.score(a) - this.score(b));
-        return sorted[0] || null;
+        const now = Date.now();
+        const eligible = this.nodes.filter((node) => node.cooldownUntil <= now);
+        const pool = eligible.length > 0 ? eligible : this.nodes;
+        const sorted = [...pool].sort((a, b) => this.score(a) - this.score(b));
+        if (sorted.length <= 1) return sorted[0] || null;
+
+        // Rotate between top candidates so traffic does not stick permanently to a single node.
+        const topCandidates = sorted.slice(0, Math.min(2, sorted.length));
+        const selected = topCandidates[this.rotationCursor % topCandidates.length] || topCandidates[0];
+        this.rotationCursor = (this.rotationCursor + 1) % topCandidates.length;
+        return selected;
     }
 
     private reportSuccess(node: ProxyHealth, latencyMs: number) {
@@ -102,6 +112,10 @@ export class ProxyBalancer {
             try {
                 const resp = await fetch(proxyUrl, {
                     ...init,
+                    headers: {
+                        ...init?.headers,
+                        "X-Proxy-Hop": "1"
+                    },
                     signal: controller.signal,
                 });
                 clearTimeout(timeout);

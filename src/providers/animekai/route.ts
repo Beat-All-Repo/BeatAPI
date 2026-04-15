@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { AnimeKai } from "./animekai.js";
 
-export const animekaiRoutes = new Hono().basePath("/animekai");
+export const animekaiRoutes = new Hono();
 
 animekaiRoutes.get("/search/:query", async (c) => {
   const query = c.req.param("query");

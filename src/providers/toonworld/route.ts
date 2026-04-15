@@ -10,7 +10,7 @@ function slugify(title: string): string {
   return title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 
-export const toonworldRoutes = new Hono().basePath("/toonworld");
+export const toonworldRoutes = new Hono();
 
 toonworldRoutes.get("/search/:q", async (c) => {
   const q = c.req.param("q");

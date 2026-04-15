@@ -75,7 +75,30 @@
       }
     ],
     "other": [
-      { "method": "GET", "path": "/api/v2/anicrush" }
+      { "method": "GET", "path": "/api/v2/anicrush" },
+      { "method": "GET", "path": "/api/v2/media/search", "query": ["q", "mode", "page", "limit"] },
+      { "method": "GET", "path": "/api/v2/manga" },
+      { "method": "GET", "path": "/api/v2/manga/search", "query": ["q", "page", "limit"] },
+      { "method": "GET", "path": "/api/v2/manga/filters/schema" },
+      { "method": "GET", "path": "/api/v2/manga/filters/counts", "query": ["q"] },
+      { "method": "GET", "path": "/api/v2/manga/providers" },
+      { "method": "GET", "path": "/api/v2/manga/:id" },
+      { "method": "GET", "path": "/api/v2/manga/mapper/:provider/chapters/:anilistId" },
+      { "method": "GET", "path": "/api/v2/manga/mapper/:provider/pages", "query": ["chapterId"] },
+      { "method": "GET", "path": "/api/v2/manga/mapper/:provider/pages/:chapterId" },
+      { "method": "GET", "path": "/api/v2/manga/:id/chapters", "query": ["provider", "providers", "language"] },
+      { "method": "GET", "path": "/api/v2/manga/:id/read", "query": ["chapterKey", "provider", "chapterId", "chapterNumber"] },
+      { "method": "GET", "path": "/api/v2/manga/:id/read/:chapterKey" },
+      { "method": "ALL", "path": "/api/v2/manga/mangaball" },
+      { "method": "ALL", "path": "/api/v2/manga/mangaball/*" },
+      { "method": "ALL", "path": "/api/v2/manga/allmanga" },
+      { "method": "ALL", "path": "/api/v2/manga/allmanga/*" },
+      { "method": "ALL", "path": "/api/v2/manga/atsu" },
+      { "method": "ALL", "path": "/api/v2/manga/atsu/*" },
+      { "method": "ALL", "path": "/api/v2/manga/mangafire" },
+      { "method": "ALL", "path": "/api/v2/manga/mangafire/*" },
+      { "method": "ALL", "path": "/api/v2/manga/adult/:provider" },
+      { "method": "ALL", "path": "/api/v2/manga/adult/:provider/*" }
     ]
   },
   "providers": {

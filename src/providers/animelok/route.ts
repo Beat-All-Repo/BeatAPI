@@ -18,8 +18,9 @@ const SCHEDULE_TTL = 7_200;
 const LANG_TTL = 86_400;
 const INFO_TTL = 86_400;
 const SOURCES_TTL = 1_800;
+const EMPTY_SOURCES_TTL = 30;
 
-export const animelokRoutes = new Hono().basePath("/animelok");
+export const animelokRoutes = new Hono();
 
 animelokRoutes.get("/home", async (c) => {
   const key = "lok:home";
@@ -111,16 +112,22 @@ animelokRoutes.get("/anime/:id", async (c) => {
 animelokRoutes.get("/watch/:id", async (c) => {
   const id = c.req.param("id");
   const ep = c.req.query("ep") || "1";
-  const key = `lok:watch:${id}:${ep}`;
-  const cached = await Cache.get(key);
-  if (cached) return c.json(JSON.parse(cached));
+  const anilistHint = String(c.req.query("anilistId") || "").trim();
+  const malHint = String(c.req.query("malId") || "").trim();
+  const forceRefresh = c.req.query("refresh") === "1" || c.req.query("noCache") === "1";
+  const key = `lok:watch:${id}:${ep}:anilist:${anilistHint || "0"}:mal:${malHint || "0"}`;
+  if (!forceRefresh) {
+    const cached = await Cache.get(key);
+    if (cached) return c.json(JSON.parse(cached));
+  }
   try {
-    let data = await watch(id, ep);
+    let data = await watch(id, ep, anilistHint || undefined, malHint || undefined);
     data = await mapProviderItem(data);
     if (data.servers) {
       data.servers = await processAllSources(data.servers);
     }
-    await Cache.set(key, JSON.stringify(data), SOURCES_TTL);
+    const hasSources = Array.isArray(data?.servers) && data.servers.length > 0;
+    await Cache.set(key, JSON.stringify(data), hasSources ? SOURCES_TTL : EMPTY_SOURCES_TTL);
     return c.json(data);
   } catch (e: any) {
     return c.json({ error: e.message }, 500);

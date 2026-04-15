@@ -1,7 +1,7 @@
 import { Logger } from "../../utils/logger.js";
 import * as crypto from "crypto";
 
-const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
 
 const TECHINMIND_HEADERS: Record<string, string> = {
   Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -11,6 +11,9 @@ const TECHINMIND_HEADERS: Record<string, string> = {
   "User-Agent": UA,
   Referer: "https://stream.techinmind.space/",
   Origin: "https://stream.techinmind.space",
+  "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Brave";v="146"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
 };
 
 const URL_SUFFIXES: Record<string, string> = {
@@ -298,9 +301,46 @@ export async function extractUniversal(playerUrl: string) {
   } catch { return null; }
 }
 
+const normalizeTmdbId = (value: unknown): string | null => {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return String(Math.trunc(value));
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (/^\d+$/.test(trimmed)) return trimmed;
+  }
+  return null;
+};
+
 // ── TMDB ID Resolution ────────────────────────────────────────────────
 export async function resolveToTmdbId(params: { tmdbId?: string; malId?: string; anilistId?: string }): Promise<string | null> {
   if (params.tmdbId) return params.tmdbId;
+
+  if (params.anilistId) {
+    try {
+      const aniZipUrl = `https://api.ani.zip/mappings?anilist_id=${params.anilistId}`;
+      Logger.info(`[HindiAPI] Resolving TMDB via AniZip: ${aniZipUrl}`);
+
+      const aniZipRes = await fetch(aniZipUrl, { signal: AbortSignal.timeout(5000) });
+      if (aniZipRes.ok) {
+        const aniZipData: any = await aniZipRes.json();
+        const tmdbFromAniZip = normalizeTmdbId(
+          aniZipData?.mappings?.themoviedb_id ??
+            aniZipData?.mappings?.tmdb_id ??
+            aniZipData?.themoviedb_id ??
+            aniZipData?.tmdb_id
+        );
+
+        if (tmdbFromAniZip) {
+          Logger.info(`[HindiAPI] TMDB resolved via AniZip: ${tmdbFromAniZip}`);
+          return tmdbFromAniZip;
+        }
+      }
+    } catch (e: any) {
+      Logger.warn(`[HindiAPI] AniZip TMDB resolution failed: ${e?.message}`);
+    }
+  }
+
   try {
     let armUrl: string;
     if (params.malId) {

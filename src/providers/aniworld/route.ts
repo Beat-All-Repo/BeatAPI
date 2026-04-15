@@ -7,7 +7,7 @@ const SEARCH_TTL = 1_800;
 const INFO_TTL = 86_400;
 const SOURCES_TTL = 1_800;
 
-export const aniworldRoutes = new Hono().basePath("/aniworld");
+export const aniworldRoutes = new Hono();
 
 aniworldRoutes.get("/search/:q", async (c) => {
   const q = c.req.param("q");

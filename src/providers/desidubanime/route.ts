@@ -8,7 +8,7 @@ const SEARCH_TTL = 1_800;
 const INFO_TTL = 86_400;
 const SOURCES_TTL = 1_800;
 
-export const desidubanimeRoutes = new Hono().basePath("/desidub");
+export const desidubanimeRoutes = new Hono();
 
 desidubanimeRoutes.get("/home", async (c) => {
   const key = "ddb:home";

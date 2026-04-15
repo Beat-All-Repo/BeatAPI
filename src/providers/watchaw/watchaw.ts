@@ -84,7 +84,7 @@ export function parseEpisodeSlug(urlOrSlug: string): { slug: string; animeSlug: 
     } else {
       fullUrl = `${BASE_URL_WAW}/episode/${slug}/`;
     }
-    const m = slug.match(/^(.+?)-(\d+)x(\d+)$/);
+    const m = slug.match(/^(.+?)-(\d+)(?:x|-)(\d+)$/i);
     if (!m) return null;
     const [, animeSlug, seasonStr, episodeStr] = m;
     const season = parseInt(seasonStr, 10);

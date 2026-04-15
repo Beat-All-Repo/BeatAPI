@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { stream } from "hono/streaming";
 import { Animepahe } from "./animepahe.js";
 
-export const animepaheRoutes = new Hono().basePath("/animepahe");
+export const animepaheRoutes = new Hono();
 
 animepaheRoutes.get("/search/:query", async (c) => {
   const query = c.req.param("query");
