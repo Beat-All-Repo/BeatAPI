@@ -3,9 +3,92 @@ import { atsu } from "./scrapers/atsu.js";
 import { mangaball } from "./scrapers/mangaball.js";
 import { mangafire } from "./scrapers/mangafire.js";
 import { AniList } from "../mapper/anilist.js";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import nodePath from "node:path";
 
 const DEFAULT_ATSU_TYPES = "Manga,Manwha,Manhua,OEL";
 const anilist = new AniList();
+const LOCALHOST_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1"]);
+const MANGA_HOME_FALLBACK_DIR = nodePath.join(process.cwd(), "fallback", "manga-home");
+
+type HomeFallbackSnapshot = {
+  provider: string;
+  savedAt: string;
+  data: unknown;
+};
+
+const isLocalhostRequest = (requestUrl: string) => {
+  try {
+    const parsed = new URL(requestUrl);
+    return LOCALHOST_HOSTNAMES.has(parsed.hostname);
+  } catch {
+    return false;
+  }
+};
+
+const getHomeFallbackFilePath = (provider: string) => {
+  const safeProvider = String(provider || "").toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  return nodePath.join(MANGA_HOME_FALLBACK_DIR, `${safeProvider || "provider"}.json`);
+};
+
+const saveHomeFallbackSnapshot = async (requestUrl: string, provider: string, data: unknown) => {
+  if (!isLocalhostRequest(requestUrl)) return;
+
+  try {
+    await mkdir(MANGA_HOME_FALLBACK_DIR, { recursive: true });
+    const payload: HomeFallbackSnapshot = {
+      provider,
+      savedAt: new Date().toISOString(),
+      data,
+    };
+    await writeFile(getHomeFallbackFilePath(provider), JSON.stringify(payload), "utf-8");
+  } catch {
+    // Snapshot persistence should not break the request path.
+  }
+};
+
+const loadHomeFallbackSnapshot = async (requestUrl: string, provider: string) => {
+  if (!isLocalhostRequest(requestUrl)) return null;
+
+  try {
+    const raw = await readFile(getHomeFallbackFilePath(provider), "utf-8");
+    const parsed = JSON.parse(raw) as Partial<HomeFallbackSnapshot>;
+    if (!parsed || typeof parsed !== "object") return null;
+    if (!("data" in parsed)) return null;
+    return parsed.data;
+  } catch {
+    return null;
+  }
+};
+
+const resolveHomeWithLocalhostFallback = async (
+  c: any,
+  provider: string,
+  fetchHome: () => Promise<unknown>
+) => {
+  const data = await fetchHome();
+  const error = scraperError(data);
+
+  if (!error) {
+    await saveHomeFallbackSnapshot(c.req.url, provider, data);
+    return ok(c, data);
+  }
+
+  const fallbackData = await loadHomeFallbackSnapshot(c.req.url, provider);
+  if (fallbackData) {
+    return c.json({
+      status: 200,
+      success: true,
+      data: fallbackData,
+      fallback: true,
+      fallbackProvider: provider,
+      fallbackReason: error,
+      fallbackSource: "localhost-home-snapshot",
+    });
+  }
+
+  return fail(c, 500, error);
+};
 
 const toPositiveInt = (raw: string | null, fallback: number) => {
   const parsed = Number.parseInt(String(raw || ""), 10);
@@ -177,9 +260,7 @@ const handleMangaball = async (c: any, segments: string[], searchParams: URLSear
   }
 
   if (head === "home") {
-    const data = await mangaball.parseHome(baseApiUrl);
-    const error = scraperError(data);
-    return error ? fail(c, 500, error) : ok(c, data);
+    return resolveHomeWithLocalhostFallback(c, "mangaball", () => mangaball.parseHome(baseApiUrl));
   }
 
   if (head === "latest") {
@@ -398,9 +479,7 @@ const handleAllmanga = async (c: any, segments: string[], searchParams: URLSearc
   const tail = segments.slice(1);
 
   if (head === "home") {
-    const data = await allmanga.parseHome(baseApiUrl);
-    const error = scraperError(data);
-    return error ? fail(c, 500, error) : ok(c, data);
+    return resolveHomeWithLocalhostFallback(c, "allmanga", () => allmanga.parseHome(baseApiUrl));
   }
 
   if (head === "search") {
@@ -533,9 +612,7 @@ const handleAtsu = async (
   }
 
   if (head === "home") {
-    const data = await atsu.parseHome(baseApiUrl, adultMode);
-    const error = scraperError(data);
-    return error ? fail(c, 500, error) : ok(c, data);
+    return resolveHomeWithLocalhostFallback(c, "atsu", () => atsu.parseHome(baseApiUrl, adultMode));
   }
 
   const sectionMap: Record<string, string> = {
@@ -663,9 +740,7 @@ const handleMangafire = async (c: any, segments: string[], searchParams: URLSear
   const tail = segments.slice(1);
 
   if (head === "home") {
-    const data = await mangafire.scrapeHomePage();
-    const error = scraperError(data);
-    return error ? fail(c, 500, error) : ok(c, data);
+    return resolveHomeWithLocalhostFallback(c, "mangafire", () => mangafire.scrapeHomePage());
   }
 
   if (head === "search") {

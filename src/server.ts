@@ -1,6 +1,7 @@
 import https from "https";
 import fs from "fs";
 import path from "path";
+import { timingSafeEqual } from "node:crypto";
 
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
@@ -22,6 +23,9 @@ import { animeRoutes } from "./providers/route.js";
 import { mangaRoutes } from "./providers/manga/route.js";
 import { logging } from "./middleware/logging.js";
 import { cacheConfigSetter, cacheControl } from "./middleware/cache.js";
+import { dailyResponseCache } from "./middleware/dailyResponseCache.js";
+import { providerJsonSnapshot } from "./middleware/providerJsonSnapshot.js";
+import { startCanonicalBackgroundJobs } from "./services/canonicalJobs.js";
 
 import pkgJson from "../package.json" with { type: "json" };
 
@@ -29,6 +33,35 @@ import pkgJson from "../package.json" with { type: "json" };
 const BASE_PATH = "/api/v2" as const;
 const DOC_SECTIONS = ["intro", "endpoints"] as const;
 type DocSection = (typeof DOC_SECTIONS)[number];
+
+const ADMIN_SECRET_HEADER = "x-admin-secret";
+
+const isPublicPath = (pathname: string) => {
+    const normalized = pathname.toLowerCase();
+
+    if (normalized === "/" || normalized === "/index.html") return true;
+    if (normalized === "/docs" || normalized.startsWith("/docs/")) return true;
+    if (normalized.startsWith("/docs-content/")) return true;
+    if (normalized.startsWith(`${BASE_PATH}/docs`)) return true;
+
+    // Manga provider image routes must stay public because image tags cannot send custom headers.
+    if (/^\/api\/v\d+\/manga\/(?:adult\/)?[^/]+\/image\/.+/.test(normalized)) return true;
+    if (/^\/manga\/(?:adult\/)?[^/]+\/image\/.+/.test(normalized)) return true;
+
+    return false;
+};
+
+const isAuthorizedWithAdminSecret = (provided: string, configured: string) => {
+    const providedBuffer = Buffer.from(provided);
+    const configuredBuffer = Buffer.from(configured);
+    if (providedBuffer.length !== configuredBuffer.length) return false;
+
+    try {
+        return timingSafeEqual(providedBuffer, configuredBuffer);
+    } catch {
+        return false;
+    }
+};
 
 const readDocSection = (section: DocSection) => {
     const docsDir = path.join(process.cwd(), "src", "docs");
@@ -97,6 +130,38 @@ const app = new Hono<ServerContext>();
 app.use(logging);
 app.use(corsConfig);
 app.use(cacheControl);
+app.use("*", async (c, next) => {
+    const pathname = new URL(c.req.url).pathname;
+
+    if (isPublicPath(pathname)) {
+        await next();
+        return;
+    }
+
+    const configuredSecret = String(env.TATAKAI_ADMIN_API_SECRET || "").trim();
+    if (!configuredSecret) {
+        return c.json(
+            {
+                success: false,
+                message: "API locked: admin secret not configured",
+            },
+            503
+        );
+    }
+
+    const providedSecret = String(c.req.header(ADMIN_SECRET_HEADER) || "").trim();
+    if (!providedSecret || !isAuthorizedWithAdminSecret(providedSecret, configuredSecret)) {
+        return c.json(
+            {
+                success: false,
+                message: "Unauthorized: X-Admin-Secret required",
+            },
+            401
+        );
+    }
+
+    await next();
+});
 
 /*
     CAUTION: 
@@ -457,6 +522,16 @@ app.route("/api/v2/hianime/proxy", proxyRouter);
 app.route("/api/v2/anime/hianime/proxy", proxyRouter);
 
 app.use(cacheConfigSetter(BASE_PATH.length));
+app.use(`${BASE_PATH}/hianime`, providerJsonSnapshot("hianime"));
+app.use(`${BASE_PATH}/hianime/*`, providerJsonSnapshot("hianime"));
+app.use(`${BASE_PATH}/anime`, providerJsonSnapshot("anime"));
+app.use(`${BASE_PATH}/anime/*`, providerJsonSnapshot("anime"));
+app.use(`${BASE_PATH}/manga`, providerJsonSnapshot("manga"));
+app.use(`${BASE_PATH}/manga/*`, providerJsonSnapshot("manga"));
+app.use(`${BASE_PATH}/anime`, dailyResponseCache("anime"));
+app.use(`${BASE_PATH}/anime/*`, dailyResponseCache("anime"));
+app.use(`${BASE_PATH}/manga`, dailyResponseCache("manga"));
+app.use(`${BASE_PATH}/manga/*`, dailyResponseCache("manga"));
 
 app.basePath(BASE_PATH).route("/hianime", hianimeRouter);
 app.basePath(BASE_PATH).route("/anime", animeRoutes);
@@ -484,11 +559,11 @@ app.onError(errorHandler);
     const server = serve({
         port: env.ANIWATCH_API_PORT,
         fetch: app.fetch,
-    }).addListener("listening", () =>
-        log.info(
-            `aniwatch-api RUNNING at http://localhost:${env.ANIWATCH_API_PORT}`
-        )
-    );
+    }).addListener("listening", () => {
+        const origin = `http://localhost:${env.ANIWATCH_API_PORT}`;
+        log.info(`aniwatch-api RUNNING at ${origin}`);
+        startCanonicalBackgroundJobs(origin);
+    });
 
     process.on("SIGINT", () => execGracefulShutdown(server));
     process.on("SIGTERM", () => execGracefulShutdown(server));

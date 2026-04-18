@@ -6,6 +6,7 @@ import { cache } from "../config/cache.js";
 import { isVerboseLoggingEnabled, log, logRateLimited } from "../config/logger.js";
 import type { ServerContext } from "../config/context.js";
 import { extractCompatStreamingInfo } from "../services/hianimeCompat.js";
+import { canonicalStore } from "../lib/canonicalStore.js";
 
 const hianime = new HiAnime.Scraper();
 const tatakaiRouter = new Hono<ServerContext>();
@@ -32,6 +33,8 @@ type TimedValue<T> = {
 const META_LOOKUP_TTL_MS = 6 * 60 * 60 * 1000;
 const POSTER_LOOKUP_TTL_MS = 12 * 60 * 60 * 1000;
 const LOOKUP_CACHE_MAX_ENTRIES = 4000;
+const EPISODE_SOURCE_CANONICAL_FRESH_MS = 12 * 60 * 60 * 1000;
+const EPISODE_SOURCE_CANONICAL_STALE_MAX_MS = 7 * 24 * 60 * 60 * 1000;
 const META_UPSTREAM_FAILURE_THRESHOLD = 8;
 const META_UPSTREAM_DEGRADED_TTL_MS = 2 * 60 * 1000;
 let metaUpstreamFailureStreak = 0;
@@ -72,6 +75,136 @@ const getTimedCacheValue = <T>(
         return undefined;
     }
     return cached.value;
+};
+
+const encodeCanonicalSegment = (value: string) =>
+    Buffer.from(String(value || "")).toString("base64url");
+
+const parseTimestampMs = (value: string | null | undefined): number | null => {
+    if (!value) return null;
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+};
+
+const buildEpisodeCanonicalKey = (
+    kind: "sources" | "stream",
+    animeEpisodeId: string,
+    server: string,
+    category: "sub" | "dub" | "raw"
+) => {
+    return [
+        "canonical:hianime",
+        kind,
+        "v1",
+        encodeCanonicalSegment(animeEpisodeId),
+        encodeCanonicalSegment(server.toLowerCase()),
+        encodeCanonicalSegment(category),
+    ].join(":");
+};
+
+const buildEpisodeServersCanonicalKey = (animeEpisodeId: string) => {
+    return [
+        "canonical:hianime",
+        "episode-servers",
+        "v1",
+        encodeCanonicalSegment(animeEpisodeId),
+    ].join(":");
+};
+
+const buildAnimeEpisodesCanonicalKey = (animeId: string) => {
+    return [
+        "canonical:hianime",
+        "anime-episodes",
+        "v1",
+        encodeCanonicalSegment(animeId),
+    ].join(":");
+};
+
+const buildNextEpisodeScheduleCanonicalKey = (animeId: string) => {
+    return [
+        "canonical:hianime",
+        "next-episode-schedule",
+        "v1",
+        encodeCanonicalSegment(animeId),
+    ].join(":");
+};
+
+const readEpisodeCanonicalSnapshot = async <T>(
+    key: string,
+    freshMs: number
+): Promise<T | null> => {
+    if (!canonicalStore.isEnabled()) return null;
+
+    try {
+        const snapshot = await canonicalStore.getSnapshotByKey(key);
+        if (!snapshot || snapshot.payload === null || snapshot.payload === undefined) {
+            return null;
+        }
+
+        const refreshedAtMs = parseTimestampMs(snapshot.refreshedAt);
+        if (refreshedAtMs !== null) {
+            const ageMs = Date.now() - refreshedAtMs;
+            if (ageMs > EPISODE_SOURCE_CANONICAL_STALE_MAX_MS) {
+                return null;
+            }
+
+            if (ageMs > freshMs) {
+                logRateLimited("hianime:canonical:stale-hit", () => {
+                    log.info({ key, ageMs }, "using stale canonical hianime episode snapshot");
+                }, 120_000);
+            }
+        }
+
+        return snapshot.payload as T;
+    } catch (error) {
+        logRateLimited("hianime:canonical:read-failed", () => {
+            log.warn(
+                { error: (error as Error)?.message || String(error) },
+                "failed reading canonical hianime episode snapshot"
+            );
+        }, 15_000);
+        return null;
+    }
+};
+
+const writeEpisodeCanonicalSnapshot = async (input: {
+    key: string;
+    routePath: string;
+    queryString: string;
+    payload: unknown;
+    projection: Record<string, unknown>;
+    ttlSeconds: number;
+}) => {
+    if (!canonicalStore.isEnabled()) return;
+
+    const refreshedAt = new Date().toISOString();
+    const expiresAt =
+        input.ttlSeconds > 0
+            ? new Date(Date.now() + input.ttlSeconds * 1000).toISOString()
+            : null;
+
+    try {
+        await canonicalStore.upsertSnapshot({
+            key: input.key,
+            scope: "hianime",
+            routePath: input.routePath,
+            queryString: input.queryString,
+            statusCode: 200,
+            projection: input.projection,
+            payload: input.payload,
+            responseHeaders: {},
+            sourceMode: "service",
+            refreshedAt,
+            expiresAt,
+        });
+    } catch (error) {
+        logRateLimited("hianime:canonical:write-failed", () => {
+            log.warn(
+                { error: (error as Error)?.message || String(error) },
+                "failed writing canonical hianime episode snapshot"
+            );
+        }, 15_000);
+    }
 };
 
 const coerceId = (value: unknown): number | null => {
@@ -866,6 +999,15 @@ tatakaiRouter.get("/episode/servers", async (c) => {
         c.req.query("animeEpisodeId") || ""
     );
 
+    const canonicalKey = buildEpisodeServersCanonicalKey(animeEpisodeId);
+    const canonicalCached = await readEpisodeCanonicalSnapshot<any[]>(
+        canonicalKey,
+        EPISODE_SOURCE_CANONICAL_FRESH_MS
+    );
+    if (canonicalCached) {
+        return c.json(await ok(canonicalCached), { status: 200 });
+    }
+
     const data = await cache.getOrSet<any>(
         async () => {
             const serversRaw = await hianime.getEpisodeServers(animeEpisodeId);
@@ -895,6 +1037,20 @@ tatakaiRouter.get("/episode/servers", async (c) => {
         cacheConfig.duration
     );
 
+    if (Array.isArray(data) && data.length > 0) {
+        await writeEpisodeCanonicalSnapshot({
+            key: canonicalKey,
+            routePath: "/internal/hianime/episode/servers",
+            queryString: `animeEpisodeId=${encodeURIComponent(animeEpisodeId)}`,
+            payload: data,
+            projection: {
+                animeEpisodeId,
+                serverCount: data.length,
+            },
+            ttlSeconds: cacheConfig.duration,
+        });
+    }
+
     return c.json(await ok(data), { status: 200 });
 });
 
@@ -911,6 +1067,21 @@ tatakaiRouter.get("/episode/sources", async (c) => {
         | "sub"
         | "dub"
         | "raw";
+
+    const canonicalKey = buildEpisodeCanonicalKey(
+        "sources",
+        animeEpisodeId,
+        server,
+        category
+    );
+
+    const canonicalCached = await readEpisodeCanonicalSnapshot<AniwatchTypes.ScrapedAnimeEpisodesSources>(
+        canonicalKey,
+        EPISODE_SOURCE_CANONICAL_FRESH_MS
+    );
+    if (canonicalCached) {
+        return c.json(await ok(canonicalCached), { status: 200 });
+    }
 
     const data = await (async () => {
         try {
@@ -940,6 +1111,23 @@ tatakaiRouter.get("/episode/sources", async (c) => {
         }
     })();
 
+    if ((data.sources || []).length > 0 || (data.subtitles || []).length > 0) {
+        await writeEpisodeCanonicalSnapshot({
+            key: canonicalKey,
+            routePath: "/internal/hianime/episode/sources",
+            queryString: `animeEpisodeId=${encodeURIComponent(animeEpisodeId)}&server=${encodeURIComponent(server)}&category=${encodeURIComponent(category)}`,
+            payload: data,
+            projection: {
+                animeEpisodeId,
+                server,
+                category,
+                sourceCount: (data.sources || []).length,
+                subtitleCount: (data.subtitles || []).length,
+            },
+            ttlSeconds: 600,
+        });
+    }
+
     return c.json(await ok(data), { status: 200 });
 });
 
@@ -956,6 +1144,21 @@ tatakaiRouter.get("/episode/stream", async (c) => {
         | "sub"
         | "dub"
         | "raw";
+
+    const canonicalKey = buildEpisodeCanonicalKey(
+        "stream",
+        animeEpisodeId,
+        server,
+        category
+    );
+
+    const canonicalCached = await readEpisodeCanonicalSnapshot<any>(
+        canonicalKey,
+        EPISODE_SOURCE_CANONICAL_FRESH_MS
+    );
+    if (canonicalCached) {
+        return c.json(await ok(canonicalCached), { status: 200 });
+    }
 
     const [sourcesRaw, serversRaw] = await Promise.all([
         hianime.getEpisodeSources(animeEpisodeId, server, category),
@@ -1017,6 +1220,24 @@ tatakaiRouter.get("/episode/stream", async (c) => {
         malID: sources.malID ?? null,
     };
 
+    if ((response.streamingLink || []).some((item) => String(item.link || "").trim().length > 0)) {
+        await writeEpisodeCanonicalSnapshot({
+            key: canonicalKey,
+            routePath: "/internal/hianime/episode/stream",
+            queryString: `animeEpisodeId=${encodeURIComponent(animeEpisodeId)}&server=${encodeURIComponent(server)}&category=${encodeURIComponent(category)}`,
+            payload: response,
+            projection: {
+                animeEpisodeId,
+                server,
+                category,
+                streamingLinkCount: (response.streamingLink || []).length,
+                subtitleCount: (response.subtitles || []).length,
+                trackCount: (response.tracks || []).length,
+            },
+            ttlSeconds: 600,
+        });
+    }
+
     return c.json(await ok(response), { status: 200 });
 });
 
@@ -1026,11 +1247,38 @@ tatakaiRouter.get("/anime/:animeId/episodes", async (c) => {
     let animeId = decodeURIComponent(c.req.param("animeId").trim());
     animeId = await resolveExternalAnimeId(animeId);
 
+    const canonicalKey = buildAnimeEpisodesCanonicalKey(animeId);
+    const canonicalCached = await readEpisodeCanonicalSnapshot<AniwatchTypes.ScrapedAnimeEpisodes>(
+        canonicalKey,
+        EPISODE_SOURCE_CANONICAL_FRESH_MS
+    );
+    if (canonicalCached) {
+        return c.json(await ok(canonicalCached), { status: 200 });
+    }
+
     const data = await cache.getOrSet<AniwatchTypes.ScrapedAnimeEpisodes>(
         async () => hianime.getEpisodes(animeId),
         cacheConfig.key,
         cacheConfig.duration
     );
+
+    const episodesCount = Array.isArray((data as any)?.episodes)
+        ? (data as any).episodes.length
+        : Array.isArray(data)
+            ? data.length
+            : 0;
+
+    await writeEpisodeCanonicalSnapshot({
+        key: canonicalKey,
+        routePath: "/internal/hianime/anime/episodes",
+        queryString: `animeId=${encodeURIComponent(animeId)}`,
+        payload: data,
+        projection: {
+            animeId,
+            episodesCount,
+        },
+        ttlSeconds: cacheConfig.duration,
+    });
 
     return c.json(await ok(data), { status: 200 });
 });
@@ -1041,11 +1289,31 @@ tatakaiRouter.get("/anime/:animeId/next-episode-schedule", async (c) => {
     let animeId = decodeURIComponent(c.req.param("animeId").trim());
     animeId = await resolveExternalAnimeId(animeId);
 
+    const canonicalKey = buildNextEpisodeScheduleCanonicalKey(animeId);
+    const canonicalCached = await readEpisodeCanonicalSnapshot<AniwatchTypes.ScrapedNextEpisodeSchedule>(
+        canonicalKey,
+        EPISODE_SOURCE_CANONICAL_FRESH_MS
+    );
+    if (canonicalCached) {
+        return c.json(await ok(canonicalCached), { status: 200 });
+    }
+
     const data = await cache.getOrSet<AniwatchTypes.ScrapedNextEpisodeSchedule>(
         async () => hianime.getNextEpisodeSchedule(animeId),
         cacheConfig.key,
         cacheConfig.duration
     );
+
+    await writeEpisodeCanonicalSnapshot({
+        key: canonicalKey,
+        routePath: "/internal/hianime/anime/next-episode-schedule",
+        queryString: `animeId=${encodeURIComponent(animeId)}`,
+        payload: data,
+        projection: {
+            animeId,
+        },
+        ttlSeconds: cacheConfig.duration,
+    });
 
     return c.json(await ok(data), { status: 200 });
 });

@@ -75,6 +75,11 @@ export const env = cleanEnv(process.env, {
         desc: "Specifies the amount of time (in seconds) a resource is served stale while a new one is fetched.",
     }),
 
+    TATAKAI_ADMIN_API_SECRET: str({
+        default: undefined,
+        desc: "Optional shared secret required for sensitive admin API routes when set.",
+    }),
+
     NODE_ENV: str({
         default: "development",
         choices: ["development", "production", "test", "staging"],

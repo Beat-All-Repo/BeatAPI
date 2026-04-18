@@ -1,4 +1,6 @@
 import { Cache } from "../../lib/cache.js";
+import { log, logRateLimited } from "../../config/logger.js";
+import { canonicalStore } from "../../lib/canonicalStore.js";
 import { AniList, type AnilistMangaInfo } from "../mapper/anilist.js";
 import type {
   FacetCountGroup,
@@ -25,6 +27,13 @@ const SEARCH_TTL_SECONDS = 120;
 const DETAIL_TTL_SECONDS = 1800;
 const CHAPTER_TTL_SECONDS = 900;
 const READ_TTL_SECONDS = 600;
+const CHAPTER_CANONICAL_FRESH_MS = 12 * 60 * 60 * 1000;
+const READ_CANONICAL_FRESH_MS = 12 * 60 * 60 * 1000;
+const CANONICAL_STALE_MAX_MS = 7 * 24 * 60 * 60 * 1000;
+
+type MangaCacheControlOptions = {
+  forceFresh?: boolean;
+};
 
 const anilist = new AniList();
 
@@ -149,6 +158,137 @@ const cacheGetJson = async <T>(key: string): Promise<T | null> => {
 
 const cacheSetJson = async (key: string, value: unknown, ttl: number) => {
   await Cache.set(key, JSON.stringify(value), ttl);
+};
+
+const encodeCanonicalSegment = (value: string) =>
+  Buffer.from(String(value || "")).toString("base64url");
+
+const parseTimestampMs = (value: string | null | undefined): number | null => {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const readCanonicalSnapshot = async <T>(
+  key: string,
+  freshMs: number
+): Promise<T | null> => {
+  if (!canonicalStore.isEnabled()) return null;
+
+  try {
+    const snapshot = await canonicalStore.getSnapshotByKey(key);
+    if (!snapshot || snapshot.payload === null || snapshot.payload === undefined) {
+      return null;
+    }
+
+    const refreshedAtMs = parseTimestampMs(snapshot.refreshedAt);
+    if (refreshedAtMs !== null) {
+      const ageMs = Date.now() - refreshedAtMs;
+      if (ageMs > CANONICAL_STALE_MAX_MS) {
+        return null;
+      }
+
+      if (ageMs > freshMs) {
+        logRateLimited("manga:canonical:stale-hit", () => {
+          log.info({ key, ageMs }, "using stale canonical manga snapshot");
+        }, 120_000);
+      }
+    }
+
+    return snapshot.payload as T;
+  } catch (error) {
+    logRateLimited("manga:canonical:read-failed", () => {
+      log.warn({ error }, "failed reading canonical manga snapshot");
+    }, 15_000);
+    return null;
+  }
+};
+
+const writeCanonicalSnapshot = async (input: {
+  key: string;
+  routePath: string;
+  queryString: string;
+  projection: Record<string, unknown>;
+  payload: unknown;
+  ttlSeconds: number;
+}) => {
+  if (!canonicalStore.isEnabled()) return;
+
+  const refreshedAt = new Date().toISOString();
+  const expiresAt =
+    input.ttlSeconds > 0
+      ? new Date(Date.now() + input.ttlSeconds * 1000).toISOString()
+      : null;
+
+  try {
+    await canonicalStore.upsertSnapshot({
+      key: input.key,
+      scope: "manga",
+      routePath: input.routePath,
+      queryString: input.queryString,
+      statusCode: 200,
+      projection: input.projection,
+      payload: input.payload,
+      responseHeaders: {},
+      sourceMode: "service",
+      refreshedAt,
+      expiresAt,
+    });
+  } catch (error) {
+    logRateLimited("manga:canonical:write-failed", () => {
+      log.warn({ error }, "failed writing canonical manga snapshot");
+    }, 15_000);
+  }
+};
+
+const queueReadImageCandidates = async (
+  response: UnifiedReadResponse,
+  malId: number | null
+) => {
+  if (!canonicalStore.isEnabled()) return;
+
+  const provider = String(response.chapter.provider || "").trim().toLowerCase() || null;
+  const anilistId = Number.isFinite(Number(response.chapter.anilistId))
+    ? Number(response.chapter.anilistId)
+    : null;
+
+  const normalizedMalId = Number.isFinite(Number(malId)) ? Number(malId) : null;
+
+  const seen = new Set<string>();
+  const candidates = response.pages
+    .map((page) => {
+      const sourceUrl = String(page.imageUrl || "").trim();
+      if (!sourceUrl || !/^https?:\/\//i.test(sourceUrl) || seen.has(sourceUrl)) {
+        return null;
+      }
+
+      seen.add(sourceUrl);
+
+      return {
+        scope: "manga" as const,
+        provider,
+        anilistId,
+        malId: normalizedMalId,
+        mediaKind: "image" as const,
+        sourceUrl,
+        metadata: {
+          chapterKey: response.chapter.chapterKey,
+          providerChapterId: response.chapter.providerChapterId,
+          pageNumber: page.pageNumber,
+        },
+      };
+    })
+    .filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate));
+
+  if (candidates.length === 0) return;
+
+  try {
+    await canonicalStore.enqueueSourceCandidates(candidates);
+  } catch (error) {
+    logRateLimited("manga:canonical:queue-image-failed", () => {
+      log.warn({ error }, "failed enqueueing manga read image candidates");
+    }, 15_000);
+  }
 };
 
 const resolveFromId = async (resolved: ResolvedMangaId): Promise<{ media: AnilistMangaInfo | null; matchedBy: "anilist" | "mal" | "title" }> => {
@@ -471,13 +611,22 @@ export const searchManga = async (
   return response;
 };
 
-export const getMangaDetail = async (id: string): Promise<MangaDetailResponse | null> => {
+export const getMangaDetail = async (
+  id: string,
+  options: MangaCacheControlOptions = {}
+): Promise<MangaDetailResponse | null> => {
   const resolved = resolveMangaId(id);
   if (!resolved) return null;
 
+  const forceFresh = Boolean(options.forceFresh);
+
   const cacheKey = `manga:detail:${resolved.raw.toLowerCase()}`;
-  const cached = await cacheGetJson<MangaDetailResponse>(cacheKey);
-  if (cached) return cached;
+  if (forceFresh) {
+    await Cache.del(cacheKey);
+  } else {
+    const cached = await cacheGetJson<MangaDetailResponse>(cacheKey);
+    if (cached) return cached;
+  }
 
   const { media, matchedBy } = await resolveFromId(resolved);
   if (!media) return null;
@@ -492,7 +641,9 @@ export const getMangaDetail = async (id: string): Promise<MangaDetailResponse | 
     detail: toUnifiedMangaDetail(media, matchedBy),
   };
 
-  await cacheSetJson(cacheKey, response, DETAIL_TTL_SECONDS);
+  if (!forceFresh) {
+    await cacheSetJson(cacheKey, response, DETAIL_TTL_SECONDS);
+  }
   return response;
 };
 
@@ -542,9 +693,10 @@ const uniqueProviders = (providers: string[]) => {
 
 export const getMangaChapters = async (
   id: string,
-  options: { providers?: string[]; language?: string } = {}
+  options: { providers?: string[]; language?: string; forceFresh?: boolean } = {}
 ): Promise<MangaChapterResponse | null> => {
-  const detail = await getMangaDetail(id);
+  const forceFresh = Boolean(options.forceFresh);
+  const detail = await getMangaDetail(id, { forceFresh });
   if (!detail) return null;
 
   const requestedProviders = uniqueProviders(options.providers && options.providers.length > 0
@@ -573,9 +725,30 @@ export const getMangaChapters = async (
   const providerKey = requestedProviders.join(",");
   const languageKey = options.language || "all";
   const cacheKey = `manga:chapters:${detail.detail.anilistId}:${providerKey}:${languageKey}`;
+  const canonicalKey = `canonical:manga:chapters:v1:${detail.detail.anilistId}:${encodeCanonicalSegment(providerKey)}:${encodeCanonicalSegment(languageKey)}`;
 
-  const cached = await cacheGetJson<MangaChapterResponse>(cacheKey);
-  if (cached) return cached;
+  if (forceFresh) {
+    await Cache.del(cacheKey);
+    if (canonicalStore.isEnabled()) {
+      try {
+        await canonicalStore.deleteSnapshotByKey(canonicalKey);
+      } catch {
+        // Ignore snapshot purge failures during force refresh.
+      }
+    }
+  } else {
+    const cached = await cacheGetJson<MangaChapterResponse>(cacheKey);
+    if (cached) return cached;
+
+    const canonicalCached = await readCanonicalSnapshot<MangaChapterResponse>(
+      canonicalKey,
+      CHAPTER_CANONICAL_FRESH_MS
+    );
+    if (canonicalCached) {
+      await cacheSetJson(cacheKey, canonicalCached, CHAPTER_TTL_SECONDS);
+      return canonicalCached;
+    }
+  }
 
   const mapperResults = await fetchAllMapperChapters(
     detail.detail.anilistId,
@@ -646,7 +819,25 @@ export const getMangaChapters = async (
     providerStatus,
   };
 
-  await cacheSetJson(cacheKey, response, CHAPTER_TTL_SECONDS);
+  if (!forceFresh) {
+    await cacheSetJson(cacheKey, response, CHAPTER_TTL_SECONDS);
+    await writeCanonicalSnapshot({
+      key: canonicalKey,
+      routePath: "/internal/manga/chapters",
+      queryString: `anilistId=${detail.detail.anilistId}&providers=${providerKey}&language=${languageKey}`,
+      projection: {
+        anilistId: detail.detail.anilistId,
+        chapterCount: response.chapters.length,
+        mappedChapterCount: response.mappedChapters.length,
+        failedProviders: response.failedProviders,
+        providers: requestedProviders,
+        language: options.language || null,
+        partial: response.partial,
+      },
+      payload: response,
+      ttlSeconds: CHAPTER_TTL_SECONDS,
+    });
+  }
   return response;
 };
 
@@ -746,8 +937,10 @@ const buildMangaReadGuidance = (
 
 export const getMangaRead = async (
   id: string,
-  selection: MangaReadSelection
+  selection: MangaReadSelection,
+  options: MangaCacheControlOptions = {}
 ): Promise<MangaReadOrchestrationResult> => {
+  const forceFresh = Boolean(options.forceFresh);
   let provider: string;
   let chapterId: string;
   let chapterNumber: number | null;
@@ -788,7 +981,7 @@ export const getMangaRead = async (
     };
   }
 
-  const detail = await getMangaDetail(id);
+  const detail = await getMangaDetail(id, { forceFresh });
   if (!detail) {
     return {
       partial: true,
@@ -800,13 +993,39 @@ export const getMangaRead = async (
 
   const chapterKey = buildChapterKey(provider, chapterId, chapterNumber);
   const readCacheKey = `manga:read:${detail.detail.anilistId}:${provider}:${chapterId}`;
-  const cached = await cacheGetJson<UnifiedReadResponse>(readCacheKey);
-  if (cached) {
-    return {
-      partial: false,
-      failedProviders: [],
-      response: cached,
-    };
+  const canonicalReadKey = `canonical:manga:read:v1:${detail.detail.anilistId}:${encodeCanonicalSegment(provider)}:${encodeCanonicalSegment(chapterId)}`;
+
+  if (forceFresh) {
+    await Cache.del(readCacheKey);
+    if (canonicalStore.isEnabled()) {
+      try {
+        await canonicalStore.deleteSnapshotByKey(canonicalReadKey);
+      } catch {
+        // Ignore snapshot purge failures during force refresh.
+      }
+    }
+  } else {
+    const cached = await cacheGetJson<UnifiedReadResponse>(readCacheKey);
+    if (cached) {
+      return {
+        partial: false,
+        failedProviders: [],
+        response: cached,
+      };
+    }
+
+    const canonicalCached = await readCanonicalSnapshot<UnifiedReadResponse>(
+      canonicalReadKey,
+      READ_CANONICAL_FRESH_MS
+    );
+    if (canonicalCached) {
+      await cacheSetJson(readCacheKey, canonicalCached, READ_TTL_SECONDS);
+      return {
+        partial: false,
+        failedProviders: [],
+        response: canonicalCached,
+      };
+    }
   }
 
   const selected = await fetchMapperPages(provider, chapterId);
@@ -830,7 +1049,25 @@ export const getMangaRead = async (
     };
 
     const response = buildReadResponse(chapter, toReadPages(selected.data), [], false);
-    await cacheSetJson(readCacheKey, response, READ_TTL_SECONDS);
+    if (!forceFresh) {
+      await cacheSetJson(readCacheKey, response, READ_TTL_SECONDS);
+      await writeCanonicalSnapshot({
+        key: canonicalReadKey,
+        routePath: "/internal/manga/read",
+        queryString: `anilistId=${detail.detail.anilistId}&provider=${provider}&chapterId=${encodeURIComponent(chapterId)}`,
+        projection: {
+          anilistId: detail.detail.anilistId,
+          provider,
+          chapterKey: response.chapter.chapterKey,
+          pageCount: response.pages.length,
+          partial: false,
+          fallbackUsed: false,
+        },
+        payload: response,
+        ttlSeconds: READ_TTL_SECONDS,
+      });
+    }
+    await queueReadImageCandidates(response, detail.detail.malId ?? null);
     return {
       partial: false,
       failedProviders: [],
@@ -924,7 +1161,26 @@ export const getMangaRead = async (
         true
       );
 
-      await cacheSetJson(readCacheKey, response, READ_TTL_SECONDS);
+      if (!forceFresh) {
+        await cacheSetJson(readCacheKey, response, READ_TTL_SECONDS);
+        await writeCanonicalSnapshot({
+          key: canonicalReadKey,
+          routePath: "/internal/manga/read",
+          queryString: `anilistId=${detail.detail.anilistId}&provider=${resolvedChapter.provider}&chapterId=${encodeURIComponent(resolvedChapter.providerChapterId)}`,
+          projection: {
+            anilistId: detail.detail.anilistId,
+            provider: resolvedChapter.provider,
+            chapterKey: response.chapter.chapterKey,
+            pageCount: response.pages.length,
+            partial: true,
+            fallbackUsed: true,
+            failedProviders: normalizedFailedProviders,
+          },
+          payload: response,
+          ttlSeconds: READ_TTL_SECONDS,
+        });
+      }
+      await queueReadImageCandidates(response, detail.detail.malId ?? null);
       return {
         partial: true,
         failedProviders: normalizedFailedProviders,

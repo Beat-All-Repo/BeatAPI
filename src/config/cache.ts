@@ -21,6 +21,8 @@ export class AniwatchAPICache {
 
     private client: Redis | null;
     public enabled: boolean = false;
+    private redisBackoffUntil = 0;
+    private redisConnectInFlight: Promise<void> | null = null;
     private inflightFetches = new Map<string, Promise<unknown>>();
     private localHotCache = new Map<string, CacheEnvelope<unknown>>();
     private localHotCacheMaxEntries = 2000;
@@ -35,7 +37,96 @@ export class AniwatchAPICache {
     constructor() {
         const redisConnURL = env.ANIWATCH_API_REDIS_CONN_URL;
         this.enabled = AniwatchAPICache.enabled = Boolean(redisConnURL);
-        this.client = this.enabled ? new Redis(String(redisConnURL)) : null;
+        this.client = this.enabled
+            ? new Redis(String(redisConnURL), {
+                  lazyConnect: true,
+                  connectTimeout: 1500,
+                  maxRetriesPerRequest: 1,
+                  enableOfflineQueue: false,
+                  retryStrategy: (times) => Math.min(times * 150, 1000),
+              })
+            : null;
+
+        if (this.client) {
+            this.client.on("error", (err) => {
+                this.markRedisBackoff(err);
+                logRateLimited("cache:redis:client-error", () => {
+                    log.warn(
+                        { error: (err as Error)?.message || String(err) },
+                        "cache redis client error"
+                    );
+                });
+            });
+
+            this.client.on("ready", () => {
+                this.redisBackoffUntil = 0;
+            });
+        }
+    }
+
+    private isRedisBackoffActive() {
+        return Date.now() < this.redisBackoffUntil;
+    }
+
+    private isRedisReady() {
+        if (!this.client) return false;
+        return this.client.status === "ready";
+    }
+
+    private ensureRedisConnected() {
+        if (!this.client) return;
+
+        const status = this.client.status;
+        if (
+            status === "ready" ||
+            status === "connect" ||
+            status === "connecting" ||
+            status === "reconnecting"
+        ) {
+            return;
+        }
+
+        if (this.redisConnectInFlight) return;
+
+        this.redisConnectInFlight = this.client
+            .connect()
+            .catch((err) => {
+                this.markRedisBackoff(err);
+                const message = this.getErrorMessage(err);
+                if (this.isRedisUnavailableMessage(message)) return;
+
+                logRateLimited("cache:redis:connect:unexpected", () => {
+                    log.warn({ error: message }, "cache redis connect failed");
+                });
+            })
+            .finally(() => {
+                this.redisConnectInFlight = null;
+            });
+    }
+
+    private getErrorMessage(err: unknown) {
+        return String((err as Error)?.message || err || "").toLowerCase();
+    }
+
+    private isRedisUnavailableMessage(message: string) {
+        return (
+            message.includes("maxretriesperrequest") ||
+            message.includes("etimedout") ||
+            message.includes("econnrefused") ||
+            message.includes("enotfound") ||
+            message.includes("stream isn't writeable") ||
+            message.includes("stream isn't writable") ||
+            message.includes("connection is closed") ||
+            message.includes("socket closed") ||
+            message.includes("reconnecting")
+        );
+    }
+
+    private markRedisBackoff(err: unknown) {
+        const message = this.getErrorMessage(err);
+        if (this.isRedisUnavailableMessage(message)) {
+            this.redisBackoffUntil = Date.now() + 60_000;
+        }
     }
 
     static getInstance() {
@@ -155,6 +246,11 @@ export class AniwatchAPICache {
         if (local) return local;
 
         if (!this.enabled || !this.client) return null;
+        if (this.isRedisBackoffActive()) return null;
+        if (!this.isRedisReady()) {
+            this.ensureRedisConnected();
+            return null;
+        }
 
         try {
             const raw = await this.client.get(key);
@@ -166,8 +262,20 @@ export class AniwatchAPICache {
             this.upsertLocalHotCache(key, envelope);
             return envelope;
         } catch (err) {
-            logRateLimited(`cache:get:${key}`, () => {
-                log.warn({ key, err }, "cache redis get failed");
+            const message = this.getErrorMessage(err);
+            this.markRedisBackoff(err);
+            if (this.isRedisUnavailableMessage(message)) {
+                logRateLimited("cache:redis:unavailable:get", () => {
+                    log.debug(
+                        { key, error: message },
+                        "cache redis unavailable, serving without redis"
+                    );
+                }, 60_000);
+                return null;
+            }
+
+            logRateLimited("cache:redis:get:unexpected", () => {
+                log.warn({ key, error: message }, "cache redis get failed");
             });
             return null;
         }
@@ -196,12 +304,26 @@ export class AniwatchAPICache {
         this.upsertLocalHotCache(key, envelope);
 
         if (!this.enabled || !this.client) return;
+        if (this.isRedisBackoffActive()) return;
+        if (!this.isRedisReady()) {
+            this.ensureRedisConnected();
+            return;
+        }
 
         try {
             await this.client.set(key, JSON.stringify(envelope), "EX", ttlStoreSeconds);
         } catch (err) {
-            logRateLimited(`cache:set:${key}`, () => {
-                log.warn({ key, err }, "cache redis set failed");
+            const message = this.getErrorMessage(err);
+            this.markRedisBackoff(err);
+            if (this.isRedisUnavailableMessage(message)) {
+                logRateLimited("cache:redis:unavailable:set", () => {
+                    log.debug({ key, error: message }, "cache redis unavailable, skipping set");
+                }, 60_000);
+                return;
+            }
+
+            logRateLimited("cache:redis:set:unexpected", () => {
+                log.warn({ key, error: message }, "cache redis set failed");
             });
         }
     }

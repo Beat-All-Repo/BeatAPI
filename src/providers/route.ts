@@ -12,8 +12,41 @@ import { techinmindRoutes } from "./techinmind/route.js";
 import { toonworldRoutes } from "./toonworld/route.js";
 import { mapperRoutes } from "./mapper/route.js";
 import { proxyRouter } from "../routes/proxy.js";
+import { runRandomSourceValidationSample } from "../services/canonicalJobs.js";
+import { canonicalStore } from "../lib/canonicalStore.js";
+import { env } from "../config/env.js";
+import { timingSafeEqual } from "node:crypto";
 
 export const animeRoutes = new Hono();
+
+const ADMIN_SECRET_HEADER = "x-admin-secret";
+
+const isAdminSecretAuthorized = (c: any) => {
+  const configuredSecret = String(env.TATAKAI_ADMIN_API_SECRET || "").trim();
+  if (!configuredSecret) return true;
+
+  const providedSecret = String(c.req.header(ADMIN_SECRET_HEADER) || "").trim();
+  if (!providedSecret) return false;
+
+  const configuredBuffer = Buffer.from(configuredSecret);
+  const providedBuffer = Buffer.from(providedSecret);
+  if (configuredBuffer.length !== providedBuffer.length) return false;
+
+  try {
+    return timingSafeEqual(configuredBuffer, providedBuffer);
+  } catch {
+    return false;
+  }
+};
+
+const unauthorizedAdminResponse = (c: any) =>
+  c.json(
+    {
+      success: false,
+      message: "Unauthorized admin operation",
+    },
+    401
+  );
 
 type ScraperHealthStatus = "operational" | "degraded" | "down";
 
@@ -48,6 +81,10 @@ animeRoutes.post("/webhooks/discord", async (c) => {
   try {
     const payload = await c.req.json<any>();
     const channel = String(payload?.channel || "") as DiscordWebhookChannel;
+
+    if (channel === "status" && !isAdminSecretAuthorized(c)) {
+      return unauthorizedAdminResponse(c);
+    }
 
     const channelEnvMap: Record<DiscordWebhookChannel, string[]> = {
       user_created: ["DISCORD_WEBHOOK_USER_CREATED", "DISCORD_WEBHOOK_USER_CREATED_URL", "DISCORD_WEBHOOK_DEFAULT"],
@@ -168,6 +205,63 @@ animeRoutes.route("/toonworld", toonworldRoutes);
 animeRoutes.route("/mapper", mapperRoutes);
 animeRoutes.route("/proxy", proxyRouter);
 animeRoutes.route("/hianime/proxy", proxyRouter);
+
+animeRoutes.get("/jobs/source-validation/random-check", async (c) => {
+  if (!isAdminSecretAuthorized(c)) {
+    return unauthorizedAdminResponse(c);
+  }
+
+  const limitRaw = Number.parseInt(String(c.req.query("limit") || ""), 10);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 50)) : 10;
+  const timeoutRaw = Number.parseInt(String(c.req.query("timeoutMs") || ""), 10);
+  const timeoutMs = Number.isFinite(timeoutRaw) ? Math.max(1500, Math.min(timeoutRaw, 20000)) : 9000;
+
+  const summary = await runRandomSourceValidationSample({
+    limit,
+    timeoutMs,
+  });
+
+  return c.json({
+    success: true,
+    ...summary,
+  });
+});
+
+animeRoutes.get("/jobs/canonical/summary", async (c) => {
+  if (!isAdminSecretAuthorized(c)) {
+    return unauthorizedAdminResponse(c);
+  }
+
+  const recentRaw = Number.parseInt(String(c.req.query("recent") || ""), 10);
+  const recent = Number.isFinite(recentRaw) ? Math.max(1, Math.min(recentRaw, 50)) : 10;
+
+  if (!canonicalStore.isEnabled()) {
+    return c.json({
+      success: true,
+      enabled: false,
+      summary: null,
+    });
+  }
+
+  try {
+    const summary = await canonicalStore.getOperationalSummary({ recentLimit: recent });
+    return c.json({
+      success: true,
+      enabled: true,
+      summary,
+    });
+  } catch (error: any) {
+    return c.json(
+      {
+        success: false,
+        enabled: true,
+        message: "Failed to read canonical summary",
+        error: error?.message || "unknown-error",
+      },
+      500
+    );
+  }
+});
 
 animeRoutes.get("/justanime/stream", async (c) => {
   const id = String(c.req.query("id") || "").trim();

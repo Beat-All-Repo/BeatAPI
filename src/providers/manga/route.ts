@@ -16,6 +16,9 @@ import {
   isSupportedMangaMapperProvider,
 } from "./mapperBridge.js";
 import { handleLocalMangaProviderRequest } from "./localProviderHandlers.js";
+import { canonicalStore } from "../../lib/canonicalStore.js";
+import { refreshMangaDailyHomeSnapshots } from "../../services/canonicalJobs.js";
+import { log, logRateLimited } from "../../config/logger.js";
 
 export const mangaRoutes = new Hono();
 
@@ -251,6 +254,14 @@ const toPositiveInteger = (value: string | undefined, fallback: number, max: num
   return Math.min(parsed, max);
 };
 
+const shouldForceFreshMangaRequest = (c: any): boolean => {
+  return (
+    c.req.query("refresh") === "1" ||
+    c.req.query("nocache") === "1" ||
+    c.req.query("snapshotRefresh") === "1"
+  );
+};
+
 mangaRoutes.get("/search", async (c) => {
   const q = String(c.req.query("q") || "").trim();
   if (!q) {
@@ -302,6 +313,115 @@ mangaRoutes.get("/providers", (c) => {
       passthrough: PROVIDER_PASSTHROUGH_KEYS,
     },
     rewriteBase: getProviderApiBase(),
+  });
+});
+
+mangaRoutes.get("/home/daily", async (c) => {
+  const requestUrl = new URL(c.req.url);
+  const selectedProviders = toNormalizedProviderList(
+    String(c.req.query("providers") || "")
+      .split(",")
+      .filter(Boolean)
+  );
+
+  const providers = selectedProviders.length > 0
+    ? selectedProviders
+    : [...PROVIDER_PASSTHROUGH_KEYS];
+
+  const dayKey = String(c.req.query("day") || new Date().toISOString().slice(0, 10)).trim();
+  const shouldRefresh = c.req.query("refresh") === "1";
+  const shouldWarmup = c.req.query("warmup") !== "0";
+  const origin = `${requestUrl.protocol}//${requestUrl.host}`;
+
+  const providerPayload: Record<string, unknown> = {};
+
+  if (canonicalStore.isEnabled()) {
+    try {
+      const rows = await canonicalStore.getDailyMangaHome(dayKey, providers);
+      for (const row of rows) {
+        providerPayload[row.provider] = row.payload;
+      }
+    } catch (error: any) {
+      logRateLimited("manga-home-daily:canonical-read", () => {
+        log.warn({ error: error?.message || String(error) }, "manga daily home canonical read failed; using snapshot fallback");
+      }, 15_000);
+    }
+  }
+
+  const missingProviders = providers.filter((provider) => !(provider in providerPayload));
+
+  if (missingProviders.length > 0) {
+    await Promise.all(
+      missingProviders.map(async (provider) => {
+        try {
+          const fallbackUrl = new URL(`/api/v2/manga/${provider}/home`, origin);
+          fallbackUrl.searchParams.set("snapshotSource", "1");
+          const response = await fetch(fallbackUrl.toString(), {
+            headers: { Accept: "application/json" },
+            signal: AbortSignal.timeout(10_000),
+          });
+
+          if (!response.ok) return;
+
+          const payload = await response.json();
+          providerPayload[provider] = payload;
+
+          if (canonicalStore.isEnabled()) {
+            await canonicalStore.upsertDailyMangaHome({
+              dayKey,
+              provider,
+              payload,
+              projection: {},
+              sourceSnapshotKey: null,
+            });
+          }
+        } catch {
+          // Best-effort fallback read; keep missing provider if unavailable.
+        }
+      })
+    );
+  }
+
+  const stillMissing = providers.filter((provider) => !(provider in providerPayload));
+
+  if (shouldRefresh) {
+    const refreshResult = await refreshMangaDailyHomeSnapshots({ origin, providers: stillMissing.length > 0 ? stillMissing : providers });
+
+    if (canonicalStore.isEnabled()) {
+      try {
+        const refreshedRows = await canonicalStore.getDailyMangaHome(dayKey, providers);
+        for (const row of refreshedRows) {
+          providerPayload[row.provider] = row.payload;
+        }
+      } catch (error: any) {
+        logRateLimited("manga-home-daily:canonical-read-refresh", () => {
+          log.warn({ error: error?.message || String(error) }, "manga daily home canonical refresh read failed");
+        }, 15_000);
+      }
+    }
+
+    return c.json({
+      success: true,
+      dayKey,
+      providers,
+      payload: providerPayload,
+      missingProviders: providers.filter((provider) => !(provider in providerPayload)),
+      refreshed: true,
+      refreshResult,
+    });
+  }
+
+  if (shouldWarmup && stillMissing.length > 0) {
+    void refreshMangaDailyHomeSnapshots({ origin, providers: stillMissing });
+  }
+
+  return c.json({
+    success: true,
+    dayKey,
+    providers,
+    payload: providerPayload,
+    missingProviders: providers.filter((provider) => !(provider in providerPayload)),
+    warming: shouldWarmup && stillMissing.length > 0,
   });
 });
 
@@ -406,6 +526,7 @@ mangaRoutes.all("/adult/:provider/*", async (c) => {
 
 mangaRoutes.get("/:id/chapters", async (c) => {
   const id = decodeURIComponent(c.req.param("id"));
+  const forceFresh = shouldForceFreshMangaRequest(c);
   const provider = String(c.req.query("provider") || "").trim();
   const providersQuery = String(c.req.query("providers") || "").trim();
   const providersFromQuery = providersQuery
@@ -420,6 +541,7 @@ mangaRoutes.get("/:id/chapters", async (c) => {
   const response = await getMangaChapters(id, {
     providers: providers.length > 0 ? providers : undefined,
     language,
+    forceFresh,
   });
   if (!response) {
     return c.json({ status: 404, message: "Manga not found" }, 404);
@@ -433,6 +555,7 @@ mangaRoutes.get("/:id/chapters", async (c) => {
 
 mangaRoutes.get("/:id/read", async (c) => {
   const id = decodeURIComponent(c.req.param("id"));
+  const forceFresh = shouldForceFreshMangaRequest(c);
   const selection: MangaReadSelection = {
     chapterKey: c.req.query("chapterKey") ? decodeURIComponent(String(c.req.query("chapterKey"))) : undefined,
     provider: c.req.query("provider") ? String(c.req.query("provider")).toLowerCase() : undefined,
@@ -454,7 +577,7 @@ mangaRoutes.get("/:id/read", async (c) => {
     );
   }
 
-  const result = await getMangaRead(id, selection);
+  const result = await getMangaRead(id, selection, { forceFresh });
   if (!result.response) {
     const status = result.error === "Invalid chapter key" ? 400 : 502;
     return c.json(
@@ -480,8 +603,9 @@ mangaRoutes.get("/:id/read", async (c) => {
 mangaRoutes.get("/:id/read/:chapterKey", async (c) => {
   const id = decodeURIComponent(c.req.param("id"));
   const chapterKey = decodeURIComponent(c.req.param("chapterKey"));
+  const forceFresh = shouldForceFreshMangaRequest(c);
 
-  const result = await getMangaRead(id, { chapterKey });
+  const result = await getMangaRead(id, { chapterKey }, { forceFresh });
   if (!result.response) {
     const status = result.error === "Invalid chapter key" ? 400 : 502;
     return c.json(
@@ -506,7 +630,8 @@ mangaRoutes.get("/:id/read/:chapterKey", async (c) => {
 
 mangaRoutes.get("/:id", async (c) => {
   const id = decodeURIComponent(c.req.param("id"));
-  const detail = await getMangaDetail(id);
+  const forceFresh = shouldForceFreshMangaRequest(c);
+  const detail = await getMangaDetail(id, { forceFresh });
 
   if (!detail) {
     return c.json({ status: 404, message: "Manga not found" }, 404);
