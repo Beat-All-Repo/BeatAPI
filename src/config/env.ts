@@ -45,8 +45,7 @@ export const env = cleanEnv(process.env, {
 
     ANIWATCH_API_DEPLOYMENT_ENV: str({
         choices: API_DEPLOYMENT_ENVIRONMENTS,
-        default: DeploymentEnv.NODEJS,
-        example: DeploymentEnv.VERCEL,
+        default: DeploymentEnv.VERCEL,
         desc: "The deployment environment of the Aniwatch API. It must be set incase of serverless deployments, otherwise you may run into weird issues.",
         docs: "https://github.com/ghoshRitesh12/aniwatch-api/blob/main/.env.example#L21",
     }),
