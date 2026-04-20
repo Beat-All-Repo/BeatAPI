@@ -135,7 +135,7 @@ const probeProxyNode = async (url: string, proxyPassword?: string) => {
     const start = performance.now();
     try {
         const probeUrl = isSelfProxyNode(url)
-            ? "http://localhost:9000/health"
+            ? "http://api.tatakai.me/health"
             : (() => {
                   const joiner = url.includes("?") ? "&" : "?";
                   const params = new URLSearchParams({
