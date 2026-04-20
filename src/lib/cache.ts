@@ -17,6 +17,8 @@ const getRedisClient = (): any => {
     return (aniwatchCache as any)?.client || null;
 };
 
+let reconnectInFlight: Promise<void> | null = null;
+
 const getErrorMessage = (err: unknown) =>
     String((err as Error)?.message || err || "").toLowerCase();
 
@@ -27,12 +29,24 @@ const isRedisUnavailableError = (err: unknown) => {
 
 const triggerReconnectIfNeeded = (client: any) => {
     const status = String(client?.status || "").toLowerCase();
-    if (!client?.connect) return;
-    if (status === "wait" || status === "end" || status === "close") {
-        void client.connect().catch(() => {
-            // Reconnect is best-effort only.
-        });
+    if (status !== "wait" && status !== "end" && status !== "close") return;
+
+    const runtimeCache = aniwatchCache as any;
+    if (typeof runtimeCache?.ensureRedisConnected === "function") {
+        runtimeCache.ensureRedisConnected();
+        return;
     }
+
+    if (!client?.connect || reconnectInFlight) return;
+
+    reconnectInFlight = Promise.resolve()
+        .then(() => client.connect())
+        .catch(() => {
+            // Reconnect is best-effort only.
+        })
+        .finally(() => {
+            reconnectInFlight = null;
+        });
 };
 
 const withSafeRedis = async <T>(
