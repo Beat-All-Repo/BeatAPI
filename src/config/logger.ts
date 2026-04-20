@@ -4,19 +4,22 @@ import { pino, type LoggerOptions } from "pino";
 const configuredLogLevel = String(process.env.LOG_LEVEL || "").trim().toLowerCase();
 const defaultLogLevel = env.isProduction ? "warn" : env.isDev ? "debug" : "info";
 const effectiveLogLevel = configuredLogLevel || defaultLogLevel;
+const shouldPrettyPrintLogs =
+    env.isDev || /^(1|true|yes|on)$/i.test(String(process.env.TATAKAI_LOG_PRETTY || "").trim());
 
 const loggerOptions: LoggerOptions = {
     redact: env.isProduction ? ["hostname", "pid"] : [],
     level: effectiveLogLevel,
     base: env.isProduction ? { service: "tatakai-api" } : undefined,
-    transport: env.isDev
+    transport: shouldPrettyPrintLogs
         ? {
               target: "pino-pretty",
               options: {
                   colorize: true,
-                  translateTime: "SYS:standard",
+                  translateTime: "SYS:hh:MM:ss TT",
                   singleLine: true,
-                  ignore: "pid,hostname",
+                  levelFirst: true,
+                  ignore: "pid,hostname,service",
               },
           }
         : undefined,
