@@ -4,7 +4,7 @@ import { buildMangaRewriteUpstreamCandidates } from "../src/providers/manga/rout
 describe("Manga Rewrite Candidate Builder", () => {
   test("builds standard provider candidates with base + common manga prefixes", () => {
     const candidates = buildMangaRewriteUpstreamCandidates(
-      "http://localhost:4010/api/v2/manga/mangaball/search?q=solo&page=1",
+      "https://api.tatakai.me:4010/api/v2/manga/mangaball/search?q=solo&page=1",
       "mangaball",
       false,
       "https://upstream.example"
@@ -16,7 +16,7 @@ describe("Manga Rewrite Candidate Builder", () => {
 
   test("adds home fallback for empty provider tail", () => {
     const candidates = buildMangaRewriteUpstreamCandidates(
-      "http://localhost:4010/api/v2/manga/allmanga",
+      "https://api.tatakai.me:4010/api/v2/manga/allmanga",
       "allmanga",
       false,
       "https://upstream.example"
@@ -28,7 +28,7 @@ describe("Manga Rewrite Candidate Builder", () => {
 
   test("adds adult alias variants and home fallback", () => {
     const candidates = buildMangaRewriteUpstreamCandidates(
-      "http://localhost:4010/api/v2/manga/adult/atsu",
+      "https://api.tatakai.me:4010/api/v2/manga/adult/atsu",
       "atsu",
       true,
       "https://upstream.example/manga"

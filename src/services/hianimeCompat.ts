@@ -33,6 +33,13 @@ const V1_BASE = "aniwatchtv.to";
 const V4_BASE = "9animetv.to";
 const FALLBACK_HD1 = "megaplay.buzz";
 const FALLBACK_HD2 = "vidwish.live";
+const BLOCKED_HOST_MARKERS = ["douvid.xyz", "haildrop77.pro"];
+
+const containsBlockedHost = (value: unknown): boolean => {
+    const normalized = String(value || "").toLowerCase();
+    if (!normalized) return false;
+    return BLOCKED_HOST_MARKERS.some((marker) => normalized.includes(marker));
+};
 
 const normalizeServerName = (name: string): string => {
     const serverName = name.trim().toLowerCase();
@@ -66,6 +73,10 @@ export async function extractCompatServers(id: string): Promise<CompatServer[]> 
             const server_id = String($(element).attr("data-server-id") || "");
             const type = String($(element).attr("data-type") || "sub") as StreamType;
             const originalName = $(element).find("a").text().trim();
+
+            if (containsBlockedHost(originalName)) {
+                return;
+            }
 
             serverData.push({
                 type,
@@ -155,6 +166,10 @@ async function decryptSourcesCompat(
                 : typeof decryptedSources?.sources === "object"
                     ? decryptedSources?.sources?.file || ""
                     : "";
+
+        if (containsBlockedHost(streamFile) || containsBlockedHost(iframeURL)) {
+            return null;
+        }
 
         return {
             link: {

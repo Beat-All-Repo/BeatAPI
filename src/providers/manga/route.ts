@@ -23,7 +23,7 @@ import { log, logRateLimited } from "../../config/logger.js";
 export const mangaRoutes = new Hono();
 
 const PROVIDER_PASSTHROUGH_KEYS = ["mangaball", "allmanga", "atsu", "mangafire"] as const;
-const MANGA_PROVIDER_DEFAULT_BASE = "http://localhost:3000/manga";
+const MANGA_PROVIDER_DEFAULT_BASE = "https://api.tatakai.me:3000/manga";
 
 const toNormalizedProviderList = (values: string[]) => {
   return [...new Set(values.map((value) => value.trim().toLowerCase()).filter(Boolean))];

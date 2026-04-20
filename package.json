@@ -12,7 +12,7 @@
         "vercel-build": "echo hello",
         "prepare": "node .husky/install.mjs",
         "test": "vitest run --config vitest.config.ts",
-        "healthcheck": "curl -f http://localhost:4000/health",
+        "healthcheck": "curl -f https://api.tatakai.me:4000/health",
         "typecheck": "tsc --noEmit",
         "format": "prettier --cache --write .",
         "format:check": "prettier --cache --check ."

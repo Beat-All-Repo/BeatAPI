@@ -52,7 +52,7 @@ const resolveDefaultMapperBaseUrl = () => {
 
   const origin = hostname.length > 0
     ? `https://${hostname}`
-    : `http://localhost:${String(process.env.ANIWATCH_API_PORT || 4000).trim()}`;
+    : `https://api.tatakai.me:${String(process.env.ANIWATCH_API_PORT || 4000).trim()}`;
 
   return `${origin}/api/v2/manga`;
 };

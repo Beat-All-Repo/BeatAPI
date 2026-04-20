@@ -691,6 +691,32 @@ const normalizeServerName = (name: string) => {
     }
 };
 
+const BLOCKED_HIANIME_HOST_MARKERS = ["douvid.xyz", "haildrop77.pro"];
+
+const includesBlockedHianimeHost = (value: unknown): boolean => {
+    const normalized = String(value || "").toLowerCase();
+    if (!normalized) return false;
+    return BLOCKED_HIANIME_HOST_MARKERS.some((marker) => normalized.includes(marker));
+};
+
+const filterBlockedServerEntries = <T extends { serverName?: string | null }>(
+    entries: T[]
+) => entries.filter((entry) => !includesBlockedHianimeHost(entry.serverName));
+
+const filterBlockedStreamLinks = <T extends {
+    link?: string | null;
+    url?: string | null;
+    file?: string | null;
+    iframe?: string | null;
+}>(entries: T[]) =>
+    entries.filter((entry) => {
+        const sourceUrl = entry.link ?? entry.url ?? entry.file ?? "";
+        return (
+            !includesBlockedHianimeHost(sourceUrl) &&
+            !includesBlockedHianimeHost(entry.iframe)
+        );
+    });
+
 // /api/v2/hianime
 tatakaiRouter.get("/", (c) => c.redirect("/", 301));
 
@@ -709,7 +735,7 @@ tatakaiRouter.get("/stream", async (c) => {
     const sources = sourcesRaw as any;
     const servers = serversRaw as any;
 
-    const mergedServers = [
+    const mergedServers = filterBlockedServerEntries([
         ...(servers.sub || []).map((item: any) => ({
             type: "sub",
             data_id: item.dataId || null,
@@ -728,15 +754,28 @@ tatakaiRouter.get("/stream", async (c) => {
             server_id: item.serverId,
             serverName: normalizeServerName(item.serverName),
         })),
-    ];
+    ]);
+
+    const availableSources = filterBlockedStreamLinks(
+        Array.isArray(sources.sources)
+            ? sources.sources.map((source: any) => ({
+                  url: source?.url || "",
+                  type: source?.type || "hls",
+              }))
+            : []
+    ) as Array<{ url: string; type: string }>;
+    const primarySource = availableSources[0];
+    const iframe = includesBlockedHianimeHost(sources.embedURL)
+        ? ""
+        : sources.embedURL || "";
 
     const response = {
         streamingLink: [
             {
-                link: sources.sources?.[0]?.url || "",
-                type: sources.sources?.[0]?.type || "hls",
+                link: primarySource?.url || "",
+                type: primarySource?.type || "hls",
                 server: normalizeServerName(server),
-                iframe: sources.embedURL || "",
+                iframe,
             },
         ],
         tracks: sources.tracks || [],
@@ -757,7 +796,7 @@ tatakaiRouter.get("/servers/:episodeId", async (c) => {
     const serversRaw = await hianime.getEpisodeServers(animeEpisodeId);
     const servers = serversRaw as any;
 
-    const mergedServers = [
+    const mergedServers = filterBlockedServerEntries([
         ...(servers.sub || []).map((item: any) => ({
             type: "sub",
             data_id: item.dataId || null,
@@ -776,7 +815,7 @@ tatakaiRouter.get("/servers/:episodeId", async (c) => {
             server_id: item.serverId,
             serverName: normalizeServerName(item.serverName),
         })),
-    ];
+    ]);
 
     return c.json({ success: true, results: mergedServers }, 200);
 });
@@ -1012,7 +1051,7 @@ tatakaiRouter.get("/episode/servers", async (c) => {
         async () => {
             const serversRaw = await hianime.getEpisodeServers(animeEpisodeId);
             const servers = serversRaw as any;
-            return [
+            return filterBlockedServerEntries([
                 ...(servers.sub || []).map((item: any) => ({
                     type: "sub",
                     data_id: item.dataId || null,
@@ -1031,7 +1070,7 @@ tatakaiRouter.get("/episode/servers", async (c) => {
                     server_id: item.serverId,
                     serverName: normalizeServerName(item.serverName),
                 })),
-            ];
+            ]);
         },
         cacheConfig.key,
         cacheConfig.duration
@@ -1088,12 +1127,22 @@ tatakaiRouter.get("/episode/sources", async (c) => {
             const streamInfo = await extractCompatStreamingInfo(animeEpisodeId, server, category);
 
             // Map hianime-api results to AniwatchTypes format expected by frontend
+            const allowedStreamingLinks = filterBlockedStreamLinks(
+                Array.isArray(streamInfo.streamingLink)
+                    ? streamInfo.streamingLink.map((s: any) => ({
+                          link: s?.link || "",
+                          type: s?.type || "hls",
+                          iframe: s?.iframe || "",
+                      }))
+                    : []
+            ) as Array<{ link: string; type: string }>;
+
             return {
-                sources: streamInfo.streamingLink?.map((s: any) => ({
+                sources: allowedStreamingLinks.map((s) => ({
                     url: s.link,
-                    type: s.type || 'hls',
-                    isM3U8: String(s.link).includes('.m3u8')
-                })) || [],
+                    type: s.type || "hls",
+                    isM3U8: String(s.link).includes(".m3u8"),
+                })),
                 subtitles: streamInfo.tracks?.map((t: any) => ({
                     url: t.file,
                     lang: t.label,
@@ -1103,7 +1152,9 @@ tatakaiRouter.get("/episode/sources", async (c) => {
                 intro: streamInfo.intro,
                 outro: streamInfo.outro,
                 server: streamInfo.server,
-                availableServers: streamInfo.servers
+                availableServers: filterBlockedServerEntries(
+                    Array.isArray(streamInfo.servers) ? streamInfo.servers : []
+                ),
             } as AniwatchTypes.ScrapedAnimeEpisodesSources;
         } catch (err) {
             log.error({ err }, "stream proxy extraction failed");
@@ -1180,7 +1231,7 @@ tatakaiRouter.get("/episode/stream", async (c) => {
         raw: Array<{ serverName: string; serverId: number | null; dataId?: string | null }>;
     };
 
-    const mergedServers = [
+    const mergedServers = filterBlockedServerEntries([
         ...servers.sub.map((item) => ({
             type: "sub",
             data_id: item.dataId || null,
@@ -1199,15 +1250,28 @@ tatakaiRouter.get("/episode/stream", async (c) => {
             server_id: item.serverId,
             serverName: normalizeServerName(item.serverName),
         })),
-    ];
+    ]);
+
+    const availableSources = filterBlockedStreamLinks(
+        Array.isArray(sources.sources)
+            ? sources.sources.map((source) => ({
+                  url: source?.url || "",
+                  type: source?.type || "hls",
+              }))
+            : []
+    ) as Array<{ url: string; type: string }>;
+    const primarySource = availableSources[0];
+    const iframe = includesBlockedHianimeHost(sources.embedURL)
+        ? ""
+        : sources.embedURL || "";
 
     const response = {
         streamingLink: [
             {
-                link: sources.sources?.[0]?.url || "",
-                type: sources.sources?.[0]?.type || "hls",
+                link: primarySource?.url || "",
+                type: primarySource?.type || "hls",
                 server: normalizeServerName(server),
-                iframe: sources.embedURL || "",
+                iframe,
             },
         ],
         tracks: sources.tracks || [],

@@ -250,6 +250,21 @@ let lastMangaHomeRefreshDay = "";
 
 export const startCanonicalBackgroundJobs = (origin: string) => {
   if (schedulerStarted) return;
+
+  let schedulerOrigin = "";
+  try {
+    schedulerOrigin = new URL(origin).origin;
+  } catch (error: any) {
+    log.warn(
+      {
+        origin,
+        error: error?.message || String(error),
+      },
+      "canonical background jobs disabled due to invalid origin"
+    );
+    return;
+  }
+
   schedulerStarted = true;
 
   const sourceCheckEnabled = isTruthyFlag(process.env.TATAKAI_SOURCE_VALIDATION_ENABLED, true);
@@ -261,12 +276,18 @@ export const startCanonicalBackgroundJobs = (origin: string) => {
 
   if (dailyHomeEnabled) {
     const maybeRefreshDaily = async () => {
-      const today = new Date().toISOString().slice(0, 10);
-      if (today === lastMangaHomeRefreshDay) return;
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        if (today === lastMangaHomeRefreshDay) return;
 
-      const result = await refreshMangaDailyHomeSnapshots({ origin });
-      if (result.ok > 0) {
-        lastMangaHomeRefreshDay = today;
+        const result = await refreshMangaDailyHomeSnapshots({ origin: schedulerOrigin });
+        if (result.ok > 0) {
+          lastMangaHomeRefreshDay = today;
+        }
+      } catch (error: any) {
+        logRateLimited("canonical-jobs:manga-home-refresh:uncaught", () => {
+          log.warn({ error: error?.message || String(error) }, "manga home refresh scheduler failed");
+        }, 15_000);
       }
     };
 
@@ -278,7 +299,13 @@ export const startCanonicalBackgroundJobs = (origin: string) => {
 
   if (sourceCheckEnabled) {
     const runSample = async () => {
-      await runRandomSourceValidationSample({ limit: sourceCheckBatch });
+      try {
+        await runRandomSourceValidationSample({ limit: sourceCheckBatch });
+      } catch (error: any) {
+        logRateLimited("canonical-jobs:source-validation:uncaught", () => {
+          log.warn({ error: error?.message || String(error) }, "source validation scheduler failed");
+        }, 15_000);
+      }
     };
 
     void runSample();
