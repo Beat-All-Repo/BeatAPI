@@ -5,7 +5,6 @@ const proxyRouter = new Hono();
 
 const DEFAULT_STREAM_PROXY_URLS = [
     "https://hoko.tatakai.me/api/v1/streamingProxy",
-    "https://moko.tatakai.me/api/v1/streamingProxy",
 ];
 
 const configuredProxyUrlsFromEnv = (process.env.STREAM_PROXY_URLS || "")
@@ -44,15 +43,20 @@ const isSelfProxyNode = (url: string) => {
     return SELF_HOST_MARKERS.some((marker) => normalized.includes(marker));
 };
 
-const externalConfiguredProxyUrls = configuredProxyUrlsFromEnv.filter((url) => !isSelfProxyNode(url));
-const hasHokoConfigured = externalConfiguredProxyUrls.some((url) =>
-    url.toLowerCase().includes("hoko.tatakai.me")
-);
-const hasMokoConfigured = externalConfiguredProxyUrls.some((url) =>
-    url.toLowerCase().includes("moko.tatakai.me")
-);
+const isMokoProxyNode = (url: string) => {
+    try {
+        const parsed = new URL(url);
+        return /(^|\.)moko\.tatakai\.me$/i.test(parsed.hostname);
+    } catch {
+        return /(^|\.)moko\.tatakai\.me/i.test(url);
+    }
+};
 
-const configuredProxyUrls = hasHokoConfigured && hasMokoConfigured
+const externalConfiguredProxyUrls = configuredProxyUrlsFromEnv
+    .filter((url) => !isSelfProxyNode(url))
+    .filter((url) => !isMokoProxyNode(url));
+
+const configuredProxyUrls = externalConfiguredProxyUrls.length > 0
     ? externalConfiguredProxyUrls
     : DEFAULT_STREAM_PROXY_URLS;
 const balancerUrls = configuredProxyUrls;
@@ -294,6 +298,9 @@ proxyRouter.get("/m3u8-streaming-proxy", async (c) => {
             ].filter(Boolean)
         )
     );
+    const maxRefererAttempts = requestType === "video" ? 3 : 2;
+    const activeRefererCandidates = refererCandidates.slice(0, maxRefererAttempts);
+    const maxUpstreamAttempts = requestType === "video" ? 4 : 3;
 
     const buildHeaders = (ref: string): Record<string, string> => {
         const isPlaylistRequest = /\.m3u8(?:$|[?#])/i.test(targetUrl);
@@ -336,6 +343,7 @@ proxyRouter.get("/m3u8-streaming-proxy", async (c) => {
         let upstream: Response | null = null;
         let successfulReferer = referer;
         let playlistBaseUrl = targetUrl;
+        let remainingAttemptBudget = maxUpstreamAttempts;
         let lastFailure: { status: number; referer: string; via: "direct" | "balancer"; reason: string } = {
             status: 502,
             referer,
@@ -386,18 +394,23 @@ proxyRouter.get("/m3u8-streaming-proxy", async (c) => {
         const isProxyHop = c.req.header("X-Proxy-Hop") === "1";
         const isVideoSegment = !targetUrl.toLowerCase().includes(".m3u8") && c.req.query("type") === "video";
 
-        for (const ref of refererCandidates) {
+        let balancerTemporarilyBypassed = false;
+
+        for (const ref of activeRefererCandidates) {
             const headers = buildHeaders(ref);
             if (isProxyHop) headers["X-Proxy-Hop"] = "1";
 
-            const shouldBypassBalancer = isProxyHop || isVideoSegment;
+            const shouldBypassBalancer = isProxyHop || isVideoSegment || balancerTemporarilyBypassed;
 
             if (balancer.hasNodes && !shouldBypassBalancer) {
+                if (remainingAttemptBudget <= 0) break;
+                remainingAttemptBudget -= 1;
+
                 try {
                     const viaBalancer = await balancer.fetch(
                         targetUrl,
                         { method: "GET", headers },
-                        12000,
+                        9000,
                         {
                             referer: ref,
                             userAgent: requestedUserAgent,
@@ -413,6 +426,9 @@ proxyRouter.get("/m3u8-streaming-proxy", async (c) => {
                         console.warn(`[Proxy Balancer] Failed for ${targetUrl} with ref ${ref}. Status: ${viaBalancer.status}`);
                     }
                 } catch (e: any) {
+                    if (String(e?.message || "").toLowerCase().includes("circuit breaker")) {
+                        balancerTemporarilyBypassed = true;
+                    }
                     lastFailure = {
                         status: 502,
                         referer: ref,
@@ -423,8 +439,12 @@ proxyRouter.get("/m3u8-streaming-proxy", async (c) => {
                 }
             }
 
+            if (upstream) break;
+            if (remainingAttemptBudget <= 0) break;
+            remainingAttemptBudget -= 1;
+
             try {
-                const direct = await fetchWithTimeout(targetUrl, { method: "GET", headers }, 15000);
+                const direct = await fetchWithTimeout(targetUrl, { method: "GET", headers }, 9000);
                 if (await isAcceptableResponse(direct, { referer: ref, via: "direct" })) {
                     upstream = direct;
                     successfulReferer = ref;
@@ -443,7 +463,16 @@ proxyRouter.get("/m3u8-streaming-proxy", async (c) => {
             }
         }
 
-        if (!upstream && FALLBACK_UPSTREAM_PROXY_URL) {
+        if (!upstream && remainingAttemptBudget <= 0) {
+            lastFailure = {
+                status: 502,
+                referer: lastFailure.referer,
+                via: lastFailure.via,
+                reason: "upstream attempt budget exhausted",
+            };
+        }
+
+        if (!upstream && FALLBACK_UPSTREAM_PROXY_URL && remainingAttemptBudget > 0) {
             const fallbackRef = lastFailure.referer || referer;
             const fallbackRequestUrl = buildFallbackProxyRequestUrl(
                 FALLBACK_UPSTREAM_PROXY_URL,
@@ -468,6 +497,8 @@ proxyRouter.get("/m3u8-streaming-proxy", async (c) => {
             })();
 
             if (!isRecursiveFallback && fallbackRequestUrl) {
+                remainingAttemptBudget -= 1;
+
                 try {
                     const fallbackResponse = await fetchWithTimeout(
                         fallbackRequestUrl,
@@ -478,7 +509,7 @@ proxyRouter.get("/m3u8-streaming-proxy", async (c) => {
                                 "User-Agent": requestedUserAgent,
                             },
                         },
-                        20000
+                        12000
                     );
 
                     if (await isAcceptableResponse(fallbackResponse, { referer: fallbackRef, via: "direct" })) {

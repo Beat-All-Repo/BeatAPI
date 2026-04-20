@@ -210,7 +210,8 @@ const proxyProviderRequest = async (c: any, provider: string, isAdultAlias: bool
         lastResponse = upstream;
         lastResponseUrl = upstreamUrl;
 
-        if (!canRetry || upstream.ok || upstream.status !== 404) {
+        const retryableStatus = upstream.status === 404 || upstream.status === 401 || upstream.status === 403;
+        if (!canRetry || upstream.ok || !retryableStatus) {
           return await toProxyResponse(upstream, upstreamUrl);
         }
       } catch (error: any) {

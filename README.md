@@ -40,4 +40,4 @@
 
 ## API
 
-[https://api.tatakai.me/docs](https://api.tatakai.me/docs)
+[http://localhost:9000/docs](http://localhost:9000/docs)

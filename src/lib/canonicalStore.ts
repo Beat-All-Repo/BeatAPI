@@ -123,11 +123,11 @@ class CanonicalStore {
       "";
 
     const parsedConnectTimeout = Number.parseInt(
-      String(process.env.TATAKAI_CANONICAL_DB_CONNECT_TIMEOUT_MS || "1200"),
+      String(process.env.TATAKAI_CANONICAL_DB_CONNECT_TIMEOUT_MS || "700"),
       10
     );
     const parsedQueryTimeout = Number.parseInt(
-      String(process.env.TATAKAI_CANONICAL_DB_QUERY_TIMEOUT_MS || "1800"),
+      String(process.env.TATAKAI_CANONICAL_DB_QUERY_TIMEOUT_MS || "1000"),
       10
     );
     const parsedBackoffMs = Number.parseInt(
@@ -137,10 +137,10 @@ class CanonicalStore {
 
     this.connectTimeoutMs = Number.isFinite(parsedConnectTimeout)
       ? Math.max(250, Math.min(parsedConnectTimeout, 15_000))
-      : 1200;
+      : 700;
     this.queryTimeoutMs = Number.isFinite(parsedQueryTimeout)
       ? Math.max(500, Math.min(parsedQueryTimeout, 20_000))
-      : 1800;
+      : 1000;
     this.outageBackoffMs = Number.isFinite(parsedBackoffMs)
       ? Math.max(5_000, Math.min(parsedBackoffMs, 5 * 60_000))
       : 60_000;
@@ -199,7 +199,55 @@ class CanonicalStore {
   }
 
   private getDbErrorMessage(error: unknown) {
-    return String((error as Error)?.message || error || "").toLowerCase();
+    const fragments: string[] = [];
+    const visited = new Set<unknown>();
+
+    const collect = (value: unknown) => {
+      if (value === null || value === undefined) return;
+      if (visited.has(value)) return;
+
+      if (typeof value === "string") {
+        fragments.push(value);
+        return;
+      }
+
+      if (typeof value === "number" || typeof value === "boolean") {
+        fragments.push(String(value));
+        return;
+      }
+
+      if (value instanceof Error) {
+        visited.add(value);
+        if (value.name) fragments.push(value.name);
+        if (value.message) fragments.push(value.message);
+
+        const asAny = value as any;
+        if (typeof asAny.code === "string" && asAny.code) {
+          fragments.push(asAny.code);
+        }
+
+        if (asAny.cause) {
+          collect(asAny.cause);
+        }
+
+        if (Array.isArray(asAny.errors)) {
+          for (const nested of asAny.errors) {
+            collect(nested);
+          }
+        }
+
+        return;
+      }
+
+      try {
+        fragments.push(String(value));
+      } catch {
+        // Ignore non-stringifiable values.
+      }
+    };
+
+    collect(error);
+    return fragments.join(" | ").toLowerCase();
   }
 
   private isDbUnavailableMessage(message: string) {

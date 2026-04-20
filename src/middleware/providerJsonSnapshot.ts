@@ -37,6 +37,14 @@ type ProviderSnapshotEnvelope = {
 const SNAPSHOT_ROOT_DIR = nodePath.join(process.cwd(), "fallback", "provider-json");
 const JSON_CONTENT_TYPE = "application/json";
 const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
+const CANONICAL_WRITE_MAX_CONCURRENCY = Math.max(
+  1,
+  Math.min(Number.parseInt(String(process.env.TATAKAI_CANONICAL_WRITE_MAX_CONCURRENCY || "2"), 10) || 2, 8)
+);
+const CANONICAL_WRITE_MAX_QUEUE = Math.max(
+  50,
+  Math.min(Number.parseInt(String(process.env.TATAKAI_CANONICAL_WRITE_MAX_QUEUE || "500"), 10) || 500, 5000)
+);
 const SNAPSHOT_CONTROL_QUERY_KEYS = new Set([
   "snapshot",
   "snapshotRefresh",
@@ -46,6 +54,65 @@ const SNAPSHOT_CONTROL_QUERY_KEYS = new Set([
   "snapshotFallback",
   "snapshotPurge",
 ]);
+
+type QueuedCanonicalWrite = {
+  key: string;
+  scope: SnapshotScope;
+  run: () => Promise<void>;
+};
+
+const canonicalWriteQueue: QueuedCanonicalWrite[] = [];
+const canonicalWriteInFlightKeys = new Set<string>();
+const canonicalWriteQueuedKeys = new Set<string>();
+let canonicalWriteInFlight = 0;
+
+const pumpCanonicalWriteQueue = () => {
+  while (canonicalWriteInFlight < CANONICAL_WRITE_MAX_CONCURRENCY && canonicalWriteQueue.length > 0) {
+    const nextTask = canonicalWriteQueue.shift();
+    if (!nextTask) break;
+
+    canonicalWriteQueuedKeys.delete(nextTask.key);
+    canonicalWriteInFlightKeys.add(nextTask.key);
+    canonicalWriteInFlight += 1;
+
+    void Promise.resolve()
+      .then(() => nextTask.run())
+      .catch((error: any) => {
+        logRateLimited(`provider-snapshot:db-queue:${nextTask.scope}`, () => {
+          log.warn(
+            { error: error?.message || String(error), scope: nextTask.scope, key: nextTask.key },
+            "canonical snapshot async write task failed"
+          );
+        }, 15_000);
+      })
+      .finally(() => {
+        canonicalWriteInFlight = Math.max(0, canonicalWriteInFlight - 1);
+        canonicalWriteInFlightKeys.delete(nextTask.key);
+        pumpCanonicalWriteQueue();
+      });
+  }
+};
+
+const enqueueCanonicalWrite = (task: QueuedCanonicalWrite) => {
+  if (canonicalWriteQueuedKeys.has(task.key) || canonicalWriteInFlightKeys.has(task.key)) {
+    return;
+  }
+
+  const totalPending = canonicalWriteInFlight + canonicalWriteQueue.length;
+  if (totalPending >= CANONICAL_WRITE_MAX_QUEUE) {
+    logRateLimited(`provider-snapshot:db-queue-full:${task.scope}`, () => {
+      log.warn(
+        { scope: task.scope, key: task.key, totalPending, maxQueue: CANONICAL_WRITE_MAX_QUEUE },
+        "canonical snapshot queue full; dropping async write"
+      );
+    }, 15_000);
+    return;
+  }
+
+  canonicalWriteQueuedKeys.add(task.key);
+  canonicalWriteQueue.push(task);
+  pumpCanonicalWriteQueue();
+};
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -540,89 +607,96 @@ export const providerJsonSnapshot = (scope: SnapshotScope): MiddlewareHandler =>
       return;
     }
 
-    try {
-      await canonicalStore.upsertSnapshot({
-        key,
-        scope,
-        routePath: requestUrl.pathname,
-        queryString: normalizedSearch,
-        statusCode: live.status,
-        projection: envelope.projection as Record<string, unknown>,
-        payload: envelope.data,
-        responseHeaders: toResponseHeaderRecord(live.headers),
-        sourceMode: "live",
-        refreshedAt: envelope.savedAt,
-        expiresAt: null,
-      });
-
-      if (scope === "manga" && /\/home$/i.test(requestUrl.pathname)) {
-        const provider = resolveProviderFromPath(scope, requestUrl.pathname) || "unknown";
-        await canonicalStore.upsertDailyMangaHome({
-          dayKey: envelope.savedAt.slice(0, 10),
-          provider,
-          payload: envelope.data,
-          projection: envelope.projection as Record<string, unknown>,
-          sourceSnapshotKey: key,
-        });
-      }
-
-      const anilistId = toNullableInt(envelope.projection.anilistId);
-      const malId = toNullableInt(envelope.projection.malId);
-      const provider = resolveProviderFromPath(scope, requestUrl.pathname);
-
-      const sourceCandidates: SourceValidationCandidate[] = [];
-      for (const sourceUrl of collectUrls(envelope.projection.sources)) {
-        sourceCandidates.push({
-          scope,
-          provider,
-          anilistId,
-          malId,
-          mediaKind: "source",
-          sourceUrl,
-          metadata: {
-            snapshotKey: key,
+    const responseHeaders = toResponseHeaderRecord(live.headers);
+    enqueueCanonicalWrite({
+      key,
+      scope,
+      run: async () => {
+        try {
+          await canonicalStore.upsertSnapshot({
+            key,
+            scope,
             routePath: requestUrl.pathname,
-          },
-        });
-      }
+            queryString: normalizedSearch,
+            statusCode: live.status,
+            projection: envelope.projection as Record<string, unknown>,
+            payload: envelope.data,
+            responseHeaders,
+            sourceMode: "live",
+            refreshedAt: envelope.savedAt,
+            expiresAt: null,
+          });
 
-      for (const sourceUrl of collectUrls(envelope.projection.subtitles)) {
-        sourceCandidates.push({
-          scope,
-          provider,
-          anilistId,
-          malId,
-          mediaKind: "subtitle",
-          sourceUrl,
-          metadata: {
-            snapshotKey: key,
-            routePath: requestUrl.pathname,
-          },
-        });
-      }
+          if (scope === "manga" && /\/home$/i.test(requestUrl.pathname)) {
+            const provider = resolveProviderFromPath(scope, requestUrl.pathname) || "unknown";
+            await canonicalStore.upsertDailyMangaHome({
+              dayKey: envelope.savedAt.slice(0, 10),
+              provider,
+              payload: envelope.data,
+              projection: envelope.projection as Record<string, unknown>,
+              sourceSnapshotKey: key,
+            });
+          }
 
-      for (const sourceUrl of collectUrls(envelope.projection.images)) {
-        sourceCandidates.push({
-          scope,
-          provider,
-          anilistId,
-          malId,
-          mediaKind: "image",
-          sourceUrl,
-          metadata: {
-            snapshotKey: key,
-            routePath: requestUrl.pathname,
-          },
-        });
-      }
+          const anilistId = toNullableInt(envelope.projection.anilistId);
+          const malId = toNullableInt(envelope.projection.malId);
+          const provider = resolveProviderFromPath(scope, requestUrl.pathname);
 
-      if (sourceCandidates.length > 0) {
-        await canonicalStore.enqueueSourceCandidates(sourceCandidates);
-      }
-    } catch (error: any) {
-      logRateLimited(`provider-snapshot:db-write:${scope}`, () => {
-        log.warn({ error: error?.message || String(error), scope, key }, "canonical snapshot write failed; filesystem snapshot retained");
-      }, 15_000);
-    }
+          const sourceCandidates: SourceValidationCandidate[] = [];
+          for (const sourceUrl of collectUrls(envelope.projection.sources)) {
+            sourceCandidates.push({
+              scope,
+              provider,
+              anilistId,
+              malId,
+              mediaKind: "source",
+              sourceUrl,
+              metadata: {
+                snapshotKey: key,
+                routePath: requestUrl.pathname,
+              },
+            });
+          }
+
+          for (const sourceUrl of collectUrls(envelope.projection.subtitles)) {
+            sourceCandidates.push({
+              scope,
+              provider,
+              anilistId,
+              malId,
+              mediaKind: "subtitle",
+              sourceUrl,
+              metadata: {
+                snapshotKey: key,
+                routePath: requestUrl.pathname,
+              },
+            });
+          }
+
+          for (const sourceUrl of collectUrls(envelope.projection.images)) {
+            sourceCandidates.push({
+              scope,
+              provider,
+              anilistId,
+              malId,
+              mediaKind: "image",
+              sourceUrl,
+              metadata: {
+                snapshotKey: key,
+                routePath: requestUrl.pathname,
+              },
+            });
+          }
+
+          if (sourceCandidates.length > 0) {
+            await canonicalStore.enqueueSourceCandidates(sourceCandidates);
+          }
+        } catch (error: any) {
+          logRateLimited(`provider-snapshot:db-write:${scope}`, () => {
+            log.warn({ error: error?.message || String(error), scope, key }, "canonical snapshot write failed; filesystem snapshot retained");
+          }, 15_000);
+        }
+      },
+    });
   };
 };

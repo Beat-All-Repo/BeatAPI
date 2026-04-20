@@ -1,5 +1,6 @@
 // @ts-ignore
 import { connect } from "puppeteer-real-browser";
+import { ensureBrowserRuntime } from "../../../lib/browser-runtime-bootstrap.js";
 
 export interface ExtractResult {
   m3u8_url: string | null;
@@ -23,9 +24,17 @@ export async function extractM3U8(embedUrl: string, referer?: string): Promise<E
 
   let browser;
   try {
+    const runtime = ensureBrowserRuntime();
+    if (!runtime.chromePath) {
+      throw new Error(
+        "No Chrome/Chromium executable found. Set CHROME_PATH or enable auto install with CF_BYPASS_AUTO_INSTALL=true."
+      );
+    }
+
     const response: any = await connect({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      disableXvfb: !runtime.hasXvfb,
     });
 
     browser = response.browser;
