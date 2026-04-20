@@ -691,7 +691,7 @@ const normalizeServerName = (name: string) => {
     }
 };
 
-const BLOCKED_HIANIME_HOST_MARKERS = ["douvid.xyz", "haildrop77.pro"];
+const BLOCKED_HIANIME_HOST_MARKERS = ["douvid.xyz", "haildrop77.pro", "fxpy7.watching.onl"];
 
 const includesBlockedHianimeHost = (value: unknown): boolean => {
     const normalized = String(value || "").toLowerCase();

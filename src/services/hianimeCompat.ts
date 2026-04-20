@@ -33,7 +33,7 @@ const V1_BASE = "aniwatchtv.to";
 const V4_BASE = "9animetv.to";
 const FALLBACK_HD1 = "megaplay.buzz";
 const FALLBACK_HD2 = "vidwish.live";
-const BLOCKED_HOST_MARKERS = ["douvid.xyz", "haildrop77.pro"];
+const BLOCKED_HOST_MARKERS = ["douvid.xyz", "haildrop77.pro", "fxpy7.watching.onl"];
 
 const containsBlockedHost = (value: unknown): boolean => {
     const normalized = String(value || "").toLowerCase();
