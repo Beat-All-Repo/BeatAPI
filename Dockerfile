@@ -28,7 +28,7 @@ COPY --from=build --chown=zoro:aniwatch /home/app/dist /app/dist
 
 # Required: server reads these at runtime via fs.readFileSync
 COPY --from=build --chown=zoro:aniwatch /home/app/src/docs /app/src/docs
-COPY --from=build --chown=zoro:aniwatch /home/app/endpoints.json /app/endpoints.json
+COPY --from=build --chown=zoro:aniwatch /home/app/endpoints/endpoints.json /app/endpoints.json
 COPY --from=build --chown=zoro:aniwatch /home/app/endpoints /app/endpoints
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
