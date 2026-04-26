@@ -1,10 +1,12 @@
 services:
   - type: web
-    name: aniwatch-api
+    name: beatapi
     runtime: docker
-    repo: https://github.com/ghoshRitesh12/aniwatch-api.git
+    repo: https://github.com/Beat-All-Repo/BeatAPI.git
     plan: free
     branch: main
     envVars:
       - key: PORT
         value: 4000
+      - key: NODE_ENV
+        value: production
