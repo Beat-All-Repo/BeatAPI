@@ -40,6 +40,7 @@ const isPublicPath = (pathname: string) => {
     const normalized = pathname.toLowerCase();
 
     if (normalized === "/" || normalized === "/index.html") return true;
+    if (normalized === "/health" || normalized === "/v") return true;
     if (normalized === "/docs" || normalized.startsWith("/docs/")) return true;
     if (normalized.startsWith("/docs-content/")) return true;
     if (normalized.startsWith(`${BASE_PATH}/docs`)) return true;
