@@ -6,21 +6,11 @@ services:
     plan: free
     branch: main
     envVars:
-      # --- Critical: tells the app to actually start a Node server ---
-      # "vercel" (the default) causes the app to exit immediately without starting
+      - key: PORT
+        value: 4000
       - key: ANIWATCH_API_DEPLOYMENT_ENV
-        value: docker
-
-      # --- Required: without this, ALL API routes return 503 "API locked" ---
-      - key: TATAKAI_ADMIN_API_SECRET
-        value: changeme-pick-a-strong-secret
-
+        value: render
       - key: NODE_ENV
         value: production
-
-      - key: ANIWATCH_API_PORT
-        value: 4000
-
-      # --- Keep-alive ping (prevents Render free tier from sleeping) ---
-      # Set this to your Render app's URL once deployed, e.g. beatapi.onrender.com
-      # ANIWATCH_API_HOSTNAME: beatapi.onrender.com
+      - key: ANIWATCH_API_CORS_ALLOWED_ORIGINS
+        value: "*"
