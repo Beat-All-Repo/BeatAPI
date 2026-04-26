@@ -8,12 +8,10 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: PORT
-        value: 4000
       - key: ANIWATCH_API_PORT
         value: 4000
       - key: ANIWATCH_API_DEPLOYMENT_ENV
-        value: render
+        value: docker
       - key: ANIWATCH_API_CORS_ALLOWED_ORIGINS
         value: "*"
       - key: ANIWATCH_API_WINDOW_MS
@@ -25,8 +23,6 @@ services:
       - key: ANIWATCH_API_STALE_WHILE_REVALIDATE
         value: 30
       - key: ANIWATCH_API_HOSTNAME
-        value: your-service-name.onrender.com
+        value: beatapi.onrender.com
       - key: TATAKAI_ADMIN_API_SECRET
-        value: changeme_use_a_strong_secret
-      - key: ANIWATCH_API_REDIS_CONN_URL
-        value: ""
+        value: your_secret_here
