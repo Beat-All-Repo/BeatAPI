@@ -8,6 +8,8 @@ services:
     envVars:
       - key: PORT
         value: 4000
+      - key: ANIWATCH_API_PORT
+        value: 4000
       - key: ANIWATCH_API_DEPLOYMENT_ENV
         value: render
       - key: NODE_ENV
