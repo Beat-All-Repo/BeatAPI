@@ -21,9 +21,9 @@ import axios, { AxiosError } from "axios";
 
 // src/utils/constants.ts
 var ACCEPT_ENCODING_HEADER = "gzip, deflate, br";
-var USER_AGENT_HEADER = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+var USER_AGENT_HEADER = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 var ACCEPT_HEADER = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9";
-var DOMAIN = process.env.ANIWATCH_DOMAIN || "aniwatchtv.to";
+var DOMAIN = process.env.ANIWATCH_DOMAIN || "hianime.cv";
 var SRC_BASE_URL = `https://${DOMAIN}`;
 var SRC_AJAX_URL = `${SRC_BASE_URL}/ajax`;
 var SRC_AJAX_VERSION_PREFIX = process.env.ANIWATCH_AJAX_VERSION_PREFIX ?? (["kaido.to", "9animetv.to", "4anime.gg"].includes(DOMAIN) ? "" : "/v2");
@@ -167,12 +167,23 @@ var AZ_LIST_SORT_OPTIONS = {
 
 // src/config/client.ts
 var clientConfig = {
-  timeout: 8e3,
+  timeout: 15e3,
   // baseURL: SRC_BASE_URL,
   headers: {
     Accept: ACCEPT_HEADER,
     "User-Agent": USER_AGENT_HEADER,
-    "Accept-Encoding": ACCEPT_ENCODING_HEADER
+    "Accept-Encoding": ACCEPT_ENCODING_HEADER,
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "sec-ch-ua": '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+    "sec-fetch-user": "?1",
+    "upgrade-insecure-requests": "1"
   }
 };
 var client = axios.create(clientConfig);
@@ -2064,7 +2075,6 @@ var MegaCloud = class {
       const sourceCandidates = [
         `https://${sourceHost}/embed-2/v3/e-1/getSources?id=${sourceId}&_k=${clientKey}`,
         `https://${sourceHost}/embed-2/ajax/e-1/getSources?id=${sourceId}`,
-        `https://megacloud.blog/embed-2/ajax/e-1/getSources?id=${sourceId}`,
         `https://megacloud.tv/embed-2/ajax/e-1/getSources?id=${sourceId}`
       ];
       let rawSourceData = null;
