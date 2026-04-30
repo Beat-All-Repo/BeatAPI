@@ -29,11 +29,26 @@ export type CompatStreamResults = {
     servers: CompatServer[];
 };
 
-const V1_BASE = "aniwatchtv.to";
+const V1_BASE = process.env.ANIWATCH_DOMAIN || "hianime.cv";
 const V4_BASE = "9animetv.to";
 const FALLBACK_HD1 = "megaplay.buzz";
 const FALLBACK_HD2 = "vidwish.live";
 const BLOCKED_HOST_MARKERS = ["douvid.xyz", "haildrop77.pro", "fxpy7.watching.onl"];
+
+const BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "sec-ch-ua": '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+};
 
 const containsBlockedHost = (value: unknown): boolean => {
     const normalized = String(value || "").toLowerCase();
@@ -63,7 +78,8 @@ const normalizeServerName = (name: string): string => {
 export async function extractCompatServers(id: string): Promise<CompatServer[]> {
     try {
         const resp = await axios.get(
-            `https://${V1_BASE}/ajax/v2/episode/servers?episodeId=${id}`
+            `https://${V1_BASE}/ajax/v2/episode/servers?episodeId=${id}`,
+            { headers: { ...BROWSER_HEADERS, Referer: `https://${V1_BASE}/` }, timeout: 15000 }
         );
         const $ = cheerio.load(resp.data.html);
         const serverData: CompatServer[] = [];
