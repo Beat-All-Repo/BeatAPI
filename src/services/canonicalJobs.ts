@@ -60,10 +60,15 @@ export const refreshMangaDailyHomeSnapshots = async (options: {
     url.searchParams.set("snapshotRefresh", "1");
     url.searchParams.set("snapshotUse", "0");
 
+    const adminSecret = String(process.env.TATAKAI_ADMIN_API_SECRET || "").trim();
+    const authHeaders: Record<string, string> = adminSecret
+      ? { "x-admin-secret": adminSecret }
+      : {};
+
     try {
       const response = await fetch(url.toString(), {
         method: "GET",
-        headers: { Accept: "application/json" },
+        headers: { Accept: "application/json", ...authHeaders },
         redirect: "follow",
         signal: AbortSignal.timeout(timeoutMs),
       });
