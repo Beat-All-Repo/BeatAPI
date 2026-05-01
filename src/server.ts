@@ -150,7 +150,11 @@ app.use("*", async (c, next) => {
         );
     }
 
-    const providedSecret = String(c.req.header(ADMIN_SECRET_HEADER) || "").trim();
+    const providedSecret = String(
+        c.req.header(ADMIN_SECRET_HEADER) ||
+        new URL(c.req.url).searchParams.get("secret") ||
+        ""
+    ).trim();
     if (!providedSecret || !isAuthorizedWithAdminSecret(providedSecret, configuredSecret)) {
         return c.json(
             {
